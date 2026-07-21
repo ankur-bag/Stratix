@@ -7,6 +7,11 @@ from fastapi import status
 
 from app.api.errors import AppError
 from app.core.auth import AuthenticatedContext
+from app.domain.intelligence import (
+    CompanyIntelligenceProfile,
+    ReinitializeResponse,
+    Snapshot,
+)
 from app.domain.onboarding import (
     CompanyOnboardingRequest,
     CompanyProfile,
@@ -169,6 +174,113 @@ class CompanyOnboardingService:
             )
         return job
 
+    async def get_snapshots(self, context: AuthenticatedContext) -> list[Snapshot]:
+        company = await self.get_company(context)
+        try:
+            return await self._persistence.snapshots.list_for_company(
+                context.organization_id, company.id
+            )
+        except RepositoryUnavailableError as exc:
+            raise self._database_unavailable_error() from exc
+
+    async def get_intelligence_profile(
+        self, context: AuthenticatedContext
+    ) -> CompanyIntelligenceProfile:
+        company = await self.get_company(context)
+        try:
+            profile = await self._persistence.company_intelligence_profiles.get_for_company(
+                context.organization_id, company.id
+            )
+        except RepositoryUnavailableError as exc:
+            raise self._database_unavailable_error() from exc
+        if profile is None:
+            raise AppError(
+                code="COMPANY_INTELLIGENCE_PROFILE_NOT_FOUND",
+                message="The company intelligence profile is not available yet.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return profile
+
+    async def reinitialize(
+        self, *, context: AuthenticatedContext, idempotency_key: str
+    ) -> ReinitializeResponse:
+        key = idempotency_key.strip()
+        if not IDEMPOTENCY_KEY_PATTERN.fullmatch(key):
+            raise AppError(
+                code="INVALID_IDEMPOTENCY_KEY",
+                message="A valid Idempotency-Key header is required.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        company = await self.get_company(context)
+        fingerprint = hashlib.sha256(f"reinitialize:{company.id}".encode()).hexdigest()
+        try:
+            existing = await self._persistence.idempotency_records.get(context.organization_id, key)
+            if existing is not None:
+                if existing.request_fingerprint != fingerprint:
+                    raise AppError(
+                        code="IDEMPOTENCY_CONFLICT",
+                        message="The idempotency key was already used for another request.",
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+                job = await self._persistence.initialization_jobs.get_by_id(
+                    context.organization_id, existing.initialization_job_id
+                )
+                if job is None:
+                    raise AppError(
+                        code="IDEMPOTENCY_CONFLICT",
+                        message="The stored idempotency result is incomplete.",
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+                return self._reinitialize_response(job)
+            active = await self._persistence.initialization_jobs.get_active_for_company(
+                context.organization_id, company.id
+            )
+            if active is not None:
+                raise AppError(
+                    code="INITIALIZATION_ALREADY_RUNNING",
+                    message="Company initialization is already running.",
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            now = utc_now()
+            job = InitializationJob(
+                id=new_id(),
+                organization_id=context.organization_id,
+                company_profile_id=company.id,
+                requested_by_user_id=context.user_id,
+                status=JobStatus.QUEUED,
+                stage=JobStage.QUEUED,
+                progress_percent=0,
+                message="Company workspace reinitialization is queued.",
+                created_at=now,
+                updated_at=now,
+            )
+            record = IdempotencyRecord(
+                id=new_id(),
+                organization_id=context.organization_id,
+                idempotency_key=key,
+                request_fingerprint=fingerprint,
+                company_profile_id=company.id,
+                initialization_job_id=job.id,
+                created_at=now,
+                expires_at=now + timedelta(days=7),
+            )
+            await self._persistence.initialization_jobs.create(job)
+            try:
+                await self._persistence.idempotency_records.create(record)
+            except Exception:
+                await self._persistence.initialization_jobs.delete(context.organization_id, job.id)
+                raise
+        except RepositoryConflictError as exc:
+            raise AppError(
+                code="IDEMPOTENCY_CONFLICT",
+                message="The idempotency key is already in use.",
+                status_code=status.HTTP_409_CONFLICT,
+            ) from exc
+        except RepositoryUnavailableError as exc:
+            raise self._database_unavailable_error() from exc
+        self._background_executor.schedule(job_id=job.id, organization_id=context.organization_id)
+        return self._reinitialize_response(job)
+
     async def _create_submission(
         self,
         context: AuthenticatedContext,
@@ -286,6 +398,18 @@ class CompanyOnboardingService:
             stage=job.stage,
             progress_percent=job.progress_percent,
             message=job.message,
+            crawl_pages_discovered=job.crawl_pages_discovered,
+            crawl_pages_processed=job.crawl_pages_processed,
+            snapshot_count=job.snapshot_count,
+        )
+
+    @staticmethod
+    def _reinitialize_response(job: InitializationJob) -> ReinitializeResponse:
+        return ReinitializeResponse(
+            initialization_job_id=job.id,
+            status=job.status,
+            stage=job.stage,
+            progress_percent=job.progress_percent,
         )
 
     @staticmethod

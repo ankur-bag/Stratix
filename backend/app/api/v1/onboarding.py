@@ -3,6 +3,11 @@ from typing import Annotated
 from fastapi import APIRouter, Header, status
 
 from app.api.dependencies import Authenticated, OnboardingService
+from app.domain.intelligence import (
+    CompanyIntelligenceProfile,
+    ReinitializeResponse,
+    Snapshot,
+)
 from app.domain.onboarding import (
     CompanyOnboardingRequest,
     CompanyProfile,
@@ -60,3 +65,33 @@ async def get_initialization_job(
 ) -> InitializationJob:
     """Return one organization-scoped initialization job."""
     return await service.get_job(context, job_id)
+
+
+@router.get("/company/intelligence-profile", response_model=CompanyIntelligenceProfile)
+async def get_company_intelligence_profile(
+    context: Authenticated, service: OnboardingService
+) -> CompanyIntelligenceProfile:
+    """Return the latest observed company intelligence profile."""
+    return await service.get_intelligence_profile(context)
+
+
+@router.get("/company/snapshots", response_model=list[Snapshot])
+async def list_company_snapshots(
+    context: Authenticated, service: OnboardingService
+) -> list[Snapshot]:
+    """Return organization-scoped company website baselines."""
+    return await service.get_snapshots(context)
+
+
+@router.post(
+    "/company/reinitialize",
+    response_model=ReinitializeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reinitialize_company(
+    context: Authenticated,
+    service: OnboardingService,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+) -> ReinitializeResponse:
+    """Queue a new baseline without deleting prior snapshots."""
+    return await service.reinitialize(context=context, idempotency_key=idempotency_key)

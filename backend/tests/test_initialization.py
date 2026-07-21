@@ -1,10 +1,25 @@
 import asyncio
 
 from app.core.auth import AuthenticatedContext
+from app.core.config import Settings
+from app.crawlers.models import CrawlError, CrawlErrorCode
+from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
 from app.domain.onboarding import CompanyOnboardingRequest, JobStage, JobStatus
+from app.graphs.company_initialization import CompanyInitializationGraph
+from app.services.extraction import (
+    CompanyIntelligenceExtractor,
+    DeterministicCompanyIntelligenceExtractor,
+    IntelligenceExtractionError,
+)
 from app.services.initialization import CompanyInitializationRunner
+from app.services.normalization import ContentNormalizer
 from app.services.onboarding import CompanyOnboardingService
-from tests.fakes import InMemoryPersistence, RecordingBackgroundExecutor
+from tests.fakes import (
+    FakeWebsiteCrawler,
+    InMemoryPersistence,
+    RecordingBackgroundExecutor,
+    crawl_page,
+)
 from tests.test_onboarding import valid_payload
 
 
@@ -22,14 +37,40 @@ def create_submission(
     return response.company_profile.id, response.initialization_job.id
 
 
+def runner(
+    persistence: InMemoryPersistence,
+    *,
+    crawler: FakeWebsiteCrawler | None = None,
+    extractor: CompanyIntelligenceExtractor | None = None,
+) -> CompanyInitializationRunner:
+    graph = CompanyInitializationGraph(
+        persistence=persistence,
+        crawler=crawler or FakeWebsiteCrawler(),
+        normalizer=ContentNormalizer(),
+        extractor=extractor or DeterministicCompanyIntelligenceExtractor(),
+        settings=Settings(
+            app_env="testing",
+            crawler_min_delay_seconds=0,
+            crawler_max_delay_seconds=0,
+            _env_file=None,
+        ),
+    )
+    return CompanyInitializationRunner(persistence, graph)
+
+
+class FailingExtractor:
+    async def extract(
+        self, *, company_profile: object, snapshots: list[Snapshot]
+    ) -> CompanyIntelligenceProfile:
+        raise IntelligenceExtractionError
+
+
 def test_runner_completes_deterministic_transitions(
     persistence: InMemoryPersistence,
 ) -> None:
     company_id, job_id = create_submission(persistence)
 
-    asyncio.run(
-        CompanyInitializationRunner(persistence).run(job_id=job_id, organization_id="org_test")
-    )
+    asyncio.run(runner(persistence).run(job_id=job_id, organization_id="org_test"))
 
     job = persistence.initialization_jobs.items[job_id]
     company = persistence.company_profiles.items[company_id]
@@ -39,14 +80,25 @@ def test_runner_completes_deterministic_transitions(
     assert job.progress_percent == 100
     assert persistence.initialization_jobs.stage_history == [
         JobStage.VALIDATING_COMPANY,
-        JobStage.CREATING_COMPANY_SOURCE,
-        JobStage.PREPARING_INTELLIGENCE_WORKSPACE,
+        JobStage.CRAWLING_COMPANY_WEBSITE,
+        JobStage.CRAWLING_COMPANY_WEBSITE,
+        JobStage.NORMALIZING_CONTENT,
+        JobStage.NORMALIZING_CONTENT,
+        JobStage.STORING_BASELINE,
+        JobStage.STORING_BASELINE,
+        JobStage.EXTRACTING_COMPANY_CONTEXT,
         JobStage.READY_FOR_DISCOVERY,
         JobStage.COMPLETED,
     ]
     assert company.onboarding_status == "ready"
-    assert company.workspace_metadata == {"discovery_state": "ready"}
+    assert company.workspace_metadata["discovery_state"] == "ready"
+    assert company.workspace_metadata["intelligence_profile_id"]
     assert source.status == "ready"
+    assert job.crawl_pages_discovered == 1
+    assert job.crawl_pages_processed == 1
+    assert job.snapshot_count == 1
+    assert len(persistence.snapshots.items) == 1
+    assert len(persistence.company_intelligence_profiles.items) == 1
 
 
 def test_runner_records_safe_failure_transitions(
@@ -55,14 +107,97 @@ def test_runner_records_safe_failure_transitions(
     company_id, job_id = create_submission(persistence)
     persistence.sources.items.clear()
 
-    asyncio.run(
-        CompanyInitializationRunner(persistence).run(job_id=job_id, organization_id="org_test")
-    )
+    asyncio.run(runner(persistence).run(job_id=job_id, organization_id="org_test"))
 
     job = persistence.initialization_jobs.items[job_id]
     company = persistence.company_profiles.items[company_id]
     assert job.status == JobStatus.FAILED
     assert job.stage == JobStage.FAILED
-    assert job.error_code == "INITIALIZATION_FAILED"
-    assert job.error_message == "Company workspace initialization could not be completed."
+    assert job.error_code == "COMPANY_SOURCE_NOT_FOUND"
+    assert job.error_message == "The primary company website source was not found."
     assert company.onboarding_status == "failed"
+
+
+def test_graph_continues_after_partial_crawl(persistence: InMemoryPersistence) -> None:
+    company_id, job_id = create_submission(persistence)
+    crawler = FakeWebsiteCrawler(
+        pages=[crawl_page()],
+        errors=[
+            CrawlError(
+                code=CrawlErrorCode.CRAWL_TIMEOUT,
+                message="A secondary page timed out.",
+                url="https://example.com/about",
+            )
+        ],
+    )
+
+    asyncio.run(runner(persistence, crawler=crawler).run(job_id=job_id, organization_id="org_test"))
+
+    job = persistence.initialization_jobs.items[job_id]
+    company = persistence.company_profiles.items[company_id]
+    profile = next(iter(persistence.company_intelligence_profiles.items.values()))
+    assert job.status == JobStatus.SUCCEEDED
+    assert company.onboarding_status == "ready"
+    assert profile.extraction_status == "partial"
+
+
+def test_graph_maps_terminal_crawler_failure(persistence: InMemoryPersistence) -> None:
+    company_id, job_id = create_submission(persistence)
+    crawler = FakeWebsiteCrawler(
+        pages=[],
+        errors=[
+            CrawlError(
+                code=CrawlErrorCode.CRAWL_TIMEOUT,
+                message="The company website did not respond within the allowed time.",
+                url="https://example.com",
+            )
+        ],
+    )
+
+    asyncio.run(runner(persistence, crawler=crawler).run(job_id=job_id, organization_id="org_test"))
+
+    job = persistence.initialization_jobs.items[job_id]
+    assert job.status == JobStatus.FAILED
+    assert job.error_code == "CRAWL_TIMEOUT"
+    assert persistence.company_profiles.items[company_id].onboarding_status == "failed"
+    assert next(iter(persistence.sources.items.values())).status == "failed"
+    assert not persistence.snapshots.items
+
+
+def test_graph_preserves_robots_denied_error_code(
+    persistence: InMemoryPersistence,
+) -> None:
+    _, job_id = create_submission(persistence)
+    crawler = FakeWebsiteCrawler(
+        pages=[],
+        errors=[
+            CrawlError(
+                code=CrawlErrorCode.CRAWL_BLOCKED_BY_ROBOTS,
+                message="The company website disallows this crawl through robots.txt.",
+                url="https://example.com",
+            )
+        ],
+    )
+
+    asyncio.run(runner(persistence, crawler=crawler).run(job_id=job_id, organization_id="org_test"))
+
+    assert persistence.initialization_jobs.items[job_id].error_code == "CRAWL_BLOCKED_BY_ROBOTS"
+
+
+def test_extraction_failure_retains_persisted_snapshots(
+    persistence: InMemoryPersistence,
+) -> None:
+    company_id, job_id = create_submission(persistence)
+
+    asyncio.run(
+        runner(persistence, extractor=FailingExtractor()).run(
+            job_id=job_id, organization_id="org_test"
+        )
+    )
+
+    job = persistence.initialization_jobs.items[job_id]
+    assert job.status == JobStatus.FAILED
+    assert job.error_code == "INTELLIGENCE_EXTRACTION_FAILED"
+    assert persistence.company_profiles.items[company_id].onboarding_status == "failed"
+    assert len(persistence.snapshots.items) == 1
+    assert not persistence.company_intelligence_profiles.items

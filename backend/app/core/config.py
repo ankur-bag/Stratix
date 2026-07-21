@@ -27,6 +27,17 @@ class Settings(BaseSettings):
     auth_disabled: bool = False
     dev_user_id: str = "user_development"
     dev_organization_id: str = "org_development"
+    crawler_user_agent: str = "StratixBot/0.1"
+    crawler_max_depth: int = 2
+    crawler_max_pages: int = 15
+    crawler_max_concurrency_per_domain: int = 1
+    crawler_min_delay_seconds: float = 4
+    crawler_max_delay_seconds: float = 8
+    crawler_max_retries: int = 2
+    crawler_page_timeout_ms: int = 45000
+    crawler_max_response_bytes: int = 5_000_000
+    crawler_check_robots: bool = True
+    llm_enabled: bool = False
 
     @model_validator(mode="after")
     def reject_insecure_production_auth(self) -> "Settings":
@@ -73,6 +84,38 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("MongoDB timeouts must be positive")
         return value
+
+    @field_validator(
+        "crawler_max_depth",
+        "crawler_max_pages",
+        "crawler_max_concurrency_per_domain",
+        "crawler_page_timeout_ms",
+        "crawler_max_response_bytes",
+    )
+    @classmethod
+    def validate_positive_crawler_limits(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("Crawler limits must be positive")
+        return value
+
+    @field_validator("crawler_max_retries")
+    @classmethod
+    def validate_retry_limit(cls, value: int) -> int:
+        if not 0 <= value <= 5:
+            raise ValueError("CRAWLER_MAX_RETRIES must be between 0 and 5")
+        return value
+
+    @model_validator(mode="after")
+    def validate_crawler_configuration(self) -> "Settings":
+        if self.crawler_max_depth > 5 or self.crawler_max_pages > 100:
+            raise ValueError("Crawler depth or page limit exceeds the safe maximum")
+        if self.crawler_max_concurrency_per_domain != 1:
+            raise ValueError("Phase 2 supports one concurrent request per domain")
+        if self.crawler_min_delay_seconds < 0:
+            raise ValueError("CRAWLER_MIN_DELAY_SECONDS cannot be negative")
+        if self.crawler_max_delay_seconds < self.crawler_min_delay_seconds:
+            raise ValueError("Crawler maximum delay must be at least the minimum delay")
+        return self
 
 
 @lru_cache

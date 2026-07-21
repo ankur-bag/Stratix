@@ -4,10 +4,10 @@ Stratix is a strategic intelligence platform for startups and product teams. It 
 designed to monitor public competitor activity, detect objective changes, and turn
 verified signals into evidence-backed strategic insights.
 
-## Phase 1 status
+## Phase 2 status
 
-Phase 1 preserves the Phase 0 backend foundation and adds the first product vertical
-slice:
+Phase 2 preserves the Phase 0 and Phase 1 foundation and adds the company intelligence
+bootstrap:
 
 - FastAPI application factory and lifespan handling
 - Environment-based, validated application settings
@@ -20,13 +20,21 @@ slice:
 - Company profile retrieval and updates
 - Automatic creation of the primary company website source
 - Persisted initialization jobs and onboarding progress APIs
-- Replaceable deterministic initialization runner and background-execution boundary
+- Crawl4AI behind a replaceable application-owned crawler interface
+- Centralized DNS, redirect, same-domain, robots, timeout, retry, and size safeguards
+- Deterministic page normalization and SHA-256 page/section hashing
+- Organization-scoped baseline snapshots and observed intelligence profiles
+- A typed LangGraph initialization workflow
+- Deterministic and optional structured-model extraction boundaries
+- Idempotent company reinitialization without deleting historical snapshots
+- Replaceable background-execution boundary
 - Offline tests using in-memory persistence and background-execution fakes
 - Ruff, mypy, and pytest development tooling
 
-The onboarding request returns `202 Accepted` as soon as its company profile, website
-source, initialization job, and idempotency result are persisted. No crawling,
-competitor discovery, or AI reasoning runs during the request.
+The onboarding request still returns `202 Accepted` as soon as its company profile,
+website source, initialization job, and idempotency result are persisted. The
+background workflow then analyzes only the user's registered public company website.
+Competitor discovery and continuous monitoring remain out of scope.
 
 ## Technology stack
 
@@ -34,6 +42,8 @@ competitor discovery, or AI reasoning runs during the request.
 - FastAPI
 - Pydantic and pydantic-settings
 - PyMongo `AsyncMongoClient` (no ODM)
+- Crawl4AI 0.9
+- LangGraph
 - structlog
 - uv for dependency and environment management
 - Ruff for formatting and linting
@@ -55,9 +65,11 @@ backend/
 |   |   |-- config.py       # Environment-backed settings
 |   |   |-- logging.py      # Structured logging configuration
 |   |   `-- request_id.py   # Request ID utilities
-|   |-- domain/             # Company, source, job, and API models
+|   |-- crawlers/           # Crawl4AI adapter, policy, and crawler schemas
+|   |-- domain/             # Company, snapshot, and intelligence models
+|   |-- graphs/             # Typed company initialization LangGraph
 |   |-- repositories/       # Persistence protocols and PyMongo implementations
-|   |-- services/           # Onboarding and deterministic initialization
+|   |-- services/           # Onboarding, normalization, extraction, and execution
 |   |-- main.py             # FastAPI application factory and entry point
 |   `-- middleware.py       # Request context middleware
 |-- tests/                  # Phase 0 automated tests
@@ -96,6 +108,15 @@ cd backend
 uv sync --dev
 ```
 
+Install Crawl4AI's local browser runtime once after dependency synchronization:
+
+```bash
+uv run crawl4ai-setup
+```
+
+This downloads browser assets for real local crawls. The offline test suite does not
+run this command and does not require browser downloads.
+
 ## Environment setup
 
 Create a local `.env` from the committed example:
@@ -115,7 +136,7 @@ Copy-Item .env.example .env
 Review the copied values and adjust them for your local environment. The application
 loads `.env` automatically.
 
-Phase 1 MongoDB and development-authentication settings are:
+MongoDB, development-authentication, and crawler settings are:
 
 ```dotenv
 MONGODB_URI=mongodb://localhost:27017
@@ -125,6 +146,17 @@ MONGODB_SERVER_SELECTION_TIMEOUT_MS=5000
 AUTH_DISABLED=true
 DEV_USER_ID=user_development
 DEV_ORGANIZATION_ID=org_development
+CRAWLER_USER_AGENT=StratixBot/0.1
+CRAWLER_MAX_DEPTH=2
+CRAWLER_MAX_PAGES=15
+CRAWLER_MAX_CONCURRENCY_PER_DOMAIN=1
+CRAWLER_MIN_DELAY_SECONDS=4
+CRAWLER_MAX_DELAY_SECONDS=8
+CRAWLER_MAX_RETRIES=2
+CRAWLER_PAGE_TIMEOUT_MS=45000
+CRAWLER_MAX_RESPONSE_BYTES=5000000
+CRAWLER_CHECK_ROBOTS=true
+LLM_ENABLED=false
 ```
 
 For MongoDB Atlas, replace `MONGODB_URI` only in your uncommitted `.env`. Atlas URIs
@@ -189,14 +221,60 @@ requiring transactions.
 
 ## Initialization jobs
 
-The deterministic runner validates the persisted company, confirms and activates its
-primary website source, prepares minimal workspace metadata, updates progress, and
-marks the company ready. It does not crawl, discover competitors, or invoke AI.
+The typed LangGraph workflow executes these persistence boundaries:
+
+```text
+validate company and source
+-> crawl the bounded company website
+-> normalize and hash usable pages
+-> persist baseline snapshots
+-> extract and persist company intelligence
+-> mark the source and company ready
+-> complete the initialization job
+```
+
+Progress is persisted during validation, crawling, normalization, baseline storage,
+context extraction, and readiness. Partial page failures are retained while usable
+pages continue. If extraction fails after snapshots are saved, those snapshots remain
+available for diagnosis or reinitialization.
 
 Local development uses an application-managed asynchronous task. The job is persisted
 before scheduling and the HTTP response does not wait for initialization. This task
 mechanism is not durable: a process restart may interrupt a running job. The executor
 boundary is designed to be replaced by a durable queue in a later phase.
+
+## Crawler safety policy
+
+Real crawls accept only public HTTP(S) targets on the registered company domain. The
+policy rejects credentials, loopback/private/link-local/metadata destinations,
+validates DNS immediately before access, validates redirect destinations, filters
+cross-domain links, and enforces depth, page, timeout, response-size, retry, delay, and
+single-domain concurrency limits. Crawl4AI robots checking is enabled by default.
+
+Persistent `403`, `429`, CAPTCHA, access-denied, or robots-denied responses stop safely
+with stable error codes. Stratix does not rotate proxies or bypass CAPTCHA, login,
+paywall, robots, or other access controls. Crawled content is untrusted input.
+
+## Intelligence extraction
+
+With the default `LLM_ENABLED=false`, Stratix uses a deterministic extractor based on
+stored titles, metadata, headings, page types, and declared onboarding context. It
+makes no model or API call.
+
+An optional structured-model extractor can be injected when `LLM_ENABLED=true`. Its
+Pydantic output must reference snapshot IDs from the current baseline; unknown or
+fabricated references fail initialization. Deep Agents are not used in Phase 2.
+
+## Phase 2 API additions
+
+- `GET /api/v1/company/intelligence-profile` returns observed public-site context.
+- `GET /api/v1/company/snapshots` returns organization-scoped baseline snapshots.
+- `POST /api/v1/company/reinitialize` requires `Idempotency-Key`, reuses the existing
+  source, preserves old snapshots, creates a new job, and returns `202 Accepted`.
+
+Reinitialization returns `INITIALIZATION_ALREADY_RUNNING` while another queued or
+running initialization job exists. Reusing the same idempotency key returns the
+original job without creating duplicates.
 
 ## Validation
 
@@ -213,10 +291,13 @@ uv run pytest
 
 The following planned components are not implemented yet:
 
-- Crawl4AI collection
 - Competitor discovery and competitor business APIs
-- LangGraph workflow orchestration
+- Continuous monitoring and deterministic before/after change detection
 - Deep Agents strategic interpretation
 - Clerk JWT verification
 - External business APIs, GitHub monitoring, social monitoring, and hiring monitoring
 - Redis, Celery, Pinecone, and durable background-job recovery
+
+Real crawling additionally requires the local Crawl4AI browser setup and public DNS
+and network access. Tests use fake DNS, crawlers, repositories, executors, and models;
+they never access a live website or MongoDB server.

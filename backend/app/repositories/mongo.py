@@ -7,6 +7,7 @@ from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from app.core.config import Settings
+from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
 from app.domain.onboarding import (
     CompanyProfile,
     IdempotencyRecord,
@@ -36,7 +37,14 @@ async def _mongo[T](operation: Awaitable[T]) -> T:
         raise RepositoryUnavailableError from exc
 
 
-def _document(model: CompanyProfile | Source | InitializationJob | IdempotencyRecord) -> Document:
+def _document(
+    model: CompanyProfile
+    | Source
+    | InitializationJob
+    | IdempotencyRecord
+    | Snapshot
+    | CompanyIntelligenceProfile,
+) -> Document:
     if isinstance(model, CompanyProfile):
         return company_document(model)
     document = model.model_dump(mode="python")
@@ -166,6 +174,16 @@ class MongoSourceRepository:
         )
         return cast(Source, model_from_document(Source, document)) if document else None
 
+    async def mark_failed(self, organization_id: str, source_id: str) -> Source | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"_id": source_id, "organization_id": organization_id},
+                {"$set": {"status": SourceStatus.FAILED, "updated_at": utc_now()}},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return cast(Source, model_from_document(Source, document)) if document else None
+
     async def delete(self, organization_id: str, source_id: str) -> None:
         await _mongo(
             self._collection.delete_one({"_id": source_id, "organization_id": organization_id})
@@ -210,6 +228,25 @@ class MongoInitializationJobRepository:
             else None
         )
 
+    async def get_active_for_company(
+        self, organization_id: str, company_profile_id: str
+    ) -> InitializationJob | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "company_profile_id": company_profile_id,
+                    "status": {"$in": [JobStatus.QUEUED, JobStatus.RUNNING]},
+                },
+                sort=[("created_at", DESCENDING)],
+            )
+        )
+        return (
+            cast(InitializationJob, model_from_document(InitializationJob, document))
+            if document
+            else None
+        )
+
     async def update_progress(
         self,
         organization_id: str,
@@ -217,11 +254,19 @@ class MongoInitializationJobRepository:
         stage: JobStage,
         progress_percent: int,
         message: str,
+        metrics: Mapping[str, int] | None = None,
     ) -> InitializationJob | None:
+        changes: dict[str, Any] = {
+            "stage": stage,
+            "progress_percent": progress_percent,
+            "message": message,
+        }
+        if metrics:
+            changes.update(metrics)
         return await self._update(
             organization_id,
             job_id,
-            {"stage": stage, "progress_percent": progress_percent, "message": message},
+            changes,
         )
 
     async def mark_running(self, organization_id: str, job_id: str) -> InitializationJob | None:
@@ -344,6 +389,73 @@ class MongoIdempotencyRepository:
         )
 
 
+class MongoSnapshotRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create_many(self, snapshots: list[Snapshot]) -> list[Snapshot]:
+        if not snapshots:
+            return []
+        try:
+            await self._collection.insert_many([_document(snapshot) for snapshot in snapshots])
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return snapshots
+
+    async def list_for_company(
+        self, organization_id: str, company_profile_id: str, *, limit: int = 100
+    ) -> list[Snapshot]:
+        cursor = self._collection.find(
+            {"organization_id": organization_id, "company_profile_id": company_profile_id}
+        ).sort("created_at", DESCENDING)
+        documents = await _mongo(cursor.to_list(length=limit))
+        return [cast(Snapshot, model_from_document(Snapshot, item)) for item in documents]
+
+
+class MongoCompanyIntelligenceRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def save(self, profile: CompanyIntelligenceProfile) -> CompanyIntelligenceProfile:
+        query = {
+            "organization_id": profile.organization_id,
+            "company_profile_id": profile.company_profile_id,
+        }
+        try:
+            existing = await self._collection.find_one(query)
+            stored = (
+                profile.model_copy(
+                    update={
+                        "id": str(existing["_id"]),
+                        "created_at": existing["created_at"],
+                    }
+                )
+                if existing
+                else profile
+            )
+            await self._collection.replace_one(query, _document(stored), upsert=True)
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return stored
+
+    async def get_for_company(
+        self, organization_id: str, company_profile_id: str
+    ) -> CompanyIntelligenceProfile | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {"organization_id": organization_id, "company_profile_id": company_profile_id}
+            )
+        )
+        return (
+            cast(
+                CompanyIntelligenceProfile,
+                model_from_document(CompanyIntelligenceProfile, document),
+            )
+            if document
+            else None
+        )
+
+
 class MongoPersistence:
     """Own the PyMongo client lifecycle, repositories, and collection indexes."""
 
@@ -355,6 +467,8 @@ class MongoPersistence:
         self.sources: MongoSourceRepository
         self.initialization_jobs: MongoInitializationJobRepository
         self.idempotency_records: MongoIdempotencyRepository
+        self.snapshots: MongoSnapshotRepository
+        self.company_intelligence_profiles: MongoCompanyIntelligenceRepository
 
     async def start(self) -> None:
         self._client = AsyncMongoClient(
@@ -370,6 +484,10 @@ class MongoPersistence:
             self._database["initialization_jobs"]
         )
         self.idempotency_records = MongoIdempotencyRepository(self._database["idempotency_records"])
+        self.snapshots = MongoSnapshotRepository(self._database["snapshots"])
+        self.company_intelligence_profiles = MongoCompanyIntelligenceRepository(
+            self._database["company_intelligence_profiles"]
+        )
         if await self.ping():
             await self._create_indexes()
 
@@ -424,5 +542,36 @@ class MongoPersistence:
                 [("organization_id", ASCENDING), ("idempotency_key", ASCENDING)], unique=True
             )
             await records.create_index("expires_at", expireAfterSeconds=0)
+            snapshots = self._database["snapshots"]
+            await snapshots.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("company_profile_id", ASCENDING),
+                    ("created_at", ASCENDING),
+                ]
+            )
+            await snapshots.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("source_id", ASCENDING),
+                    ("fetched_at", ASCENDING),
+                ]
+            )
+            await snapshots.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("source_id", ASCENDING),
+                    ("final_url", ASCENDING),
+                    ("fetched_at", ASCENDING),
+                ]
+            )
+            await snapshots.create_index(
+                [("organization_id", ASCENDING), ("content_hash", ASCENDING)]
+            )
+            intelligence = self._database["company_intelligence_profiles"]
+            await intelligence.create_index(
+                [("organization_id", ASCENDING), ("company_profile_id", ASCENDING)],
+                unique=True,
+            )
         except PyMongoError as exc:
             raise RepositoryUnavailableError from exc

@@ -140,6 +140,10 @@ class JobStatus(StrEnum):
 class JobStage(StrEnum):
     QUEUED = "queued"
     VALIDATING_COMPANY = "validating_company"
+    CRAWLING_COMPANY_WEBSITE = "crawling_company_website"
+    NORMALIZING_CONTENT = "normalizing_content"
+    STORING_BASELINE = "storing_baseline"
+    EXTRACTING_COMPANY_CONTEXT = "extracting_company_context"
     CREATING_COMPANY_SOURCE = "creating_company_source"
     PREPARING_INTELLIGENCE_WORKSPACE = "preparing_intelligence_workspace"
     READY_FOR_DISCOVERY = "ready_for_discovery"
@@ -314,6 +318,9 @@ class InitializationJob(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     updated_at: datetime
+    crawl_pages_discovered: int = Field(default=0, ge=0)
+    crawl_pages_processed: int = Field(default=0, ge=0)
+    snapshot_count: int = Field(default=0, ge=0)
 
 
 class IdempotencyRecord(BaseModel):
@@ -342,6 +349,9 @@ class JobSummary(BaseModel):
     stage: JobStage
     progress_percent: int
     message: str | None = None
+    crawl_pages_discovered: int = 0
+    crawl_pages_processed: int = 0
+    snapshot_count: int = 0
 
 
 class OnboardingResponse(BaseModel):

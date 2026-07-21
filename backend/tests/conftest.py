@@ -8,7 +8,7 @@ from app.api.dependencies import get_authenticated_context
 from app.core.auth import AuthenticatedContext
 from app.core.config import Settings
 from app.main import create_app
-from tests.fakes import InMemoryPersistence, RecordingBackgroundExecutor
+from tests.fakes import FakeWebsiteCrawler, InMemoryPersistence, RecordingBackgroundExecutor
 
 
 @pytest.fixture
@@ -31,6 +31,7 @@ def application(
         settings,
         persistence=persistence,
         background_executor=background_executor,
+        crawler=FakeWebsiteCrawler(),
     )
 
     async def test_context() -> AuthenticatedContext:

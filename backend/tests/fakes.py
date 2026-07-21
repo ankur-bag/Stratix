@@ -1,6 +1,14 @@
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
+from app.crawlers.models import (
+    CrawlError,
+    CrawlPageResult,
+    CrawlRequest,
+    CrawlResult,
+)
+from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
 from app.domain.onboarding import (
     CompanyProfile,
     IdempotencyRecord,
@@ -117,6 +125,14 @@ class InMemorySourceRepository:
         self.items[source_id] = updated
         return updated
 
+    async def mark_failed(self, organization_id: str, source_id: str) -> Source | None:
+        item = self.items.get(source_id)
+        if item is None or item.organization_id != organization_id:
+            return None
+        updated = item.model_copy(update={"status": SourceStatus.FAILED, "updated_at": utc_now()})
+        self.items[source_id] = updated
+        return updated
+
     async def delete(self, organization_id: str, source_id: str) -> None:
         item = self.items.get(source_id)
         if item and item.organization_id == organization_id:
@@ -147,6 +163,18 @@ class InMemoryInitializationJobRepository:
         ]
         return max(matches, key=lambda item: item.created_at) if matches else None
 
+    async def get_active_for_company(
+        self, organization_id: str, company_profile_id: str
+    ) -> InitializationJob | None:
+        matches = [
+            item
+            for item in self.items.values()
+            if item.organization_id == organization_id
+            and item.company_profile_id == company_profile_id
+            and item.status in {JobStatus.QUEUED, JobStatus.RUNNING}
+        ]
+        return max(matches, key=lambda item: item.created_at) if matches else None
+
     async def update_progress(
         self,
         organization_id: str,
@@ -154,11 +182,19 @@ class InMemoryInitializationJobRepository:
         stage: JobStage,
         progress_percent: int,
         message: str,
+        metrics: Mapping[str, int] | None = None,
     ) -> InitializationJob | None:
+        changes: dict[str, Any] = {
+            "stage": stage,
+            "progress_percent": progress_percent,
+            "message": message,
+        }
+        if metrics:
+            changes.update(metrics)
         return await self._update(
             organization_id,
             job_id,
-            {"stage": stage, "progress_percent": progress_percent, "message": message},
+            changes,
         )
 
     async def mark_running(self, organization_id: str, job_id: str) -> InitializationJob | None:
@@ -255,12 +291,64 @@ class InMemoryIdempotencyRepository:
         self.items.pop((organization_id, idempotency_key), None)
 
 
+class InMemorySnapshotRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, Snapshot] = {}
+
+    async def create_many(self, snapshots: list[Snapshot]) -> list[Snapshot]:
+        self.items.update({snapshot.id: snapshot for snapshot in snapshots})
+        return snapshots
+
+    async def list_for_company(
+        self, organization_id: str, company_profile_id: str, *, limit: int = 100
+    ) -> list[Snapshot]:
+        matches = [
+            item
+            for item in self.items.values()
+            if item.organization_id == organization_id
+            and item.company_profile_id == company_profile_id
+        ]
+        return sorted(matches, key=lambda item: item.created_at, reverse=True)[:limit]
+
+
+class InMemoryCompanyIntelligenceRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, CompanyIntelligenceProfile] = {}
+
+    async def save(self, profile: CompanyIntelligenceProfile) -> CompanyIntelligenceProfile:
+        stored = profile
+        for identifier, item in list(self.items.items()):
+            if (
+                item.organization_id == profile.organization_id
+                and item.company_profile_id == profile.company_profile_id
+            ):
+                self.items.pop(identifier)
+                stored = profile.model_copy(update={"id": item.id, "created_at": item.created_at})
+        self.items[stored.id] = stored
+        return stored
+
+    async def get_for_company(
+        self, organization_id: str, company_profile_id: str
+    ) -> CompanyIntelligenceProfile | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.company_profile_id == company_profile_id
+            ),
+            None,
+        )
+
+
 class InMemoryPersistence:
     def __init__(self, *, ready: bool = True) -> None:
         self.company_profiles = InMemoryCompanyProfileRepository()
         self.sources = InMemorySourceRepository()
         self.initialization_jobs = InMemoryInitializationJobRepository()
         self.idempotency_records = InMemoryIdempotencyRepository()
+        self.snapshots = InMemorySnapshotRepository()
+        self.company_intelligence_profiles = InMemoryCompanyIntelligenceRepository()
         self.ready = ready
         self.started = False
         self.closed = False
@@ -284,3 +372,45 @@ class RecordingBackgroundExecutor:
 
     async def close(self) -> None:
         return None
+
+
+def crawl_page(
+    *,
+    url: str = "https://example.com",
+    markdown: str = "# Example AI\n\n## Features\n\nReal-time voice agents",
+    links: list[str] | None = None,
+) -> CrawlPageResult:
+    return CrawlPageResult(
+        requested_url=url,
+        final_url=url,
+        status_code=200,
+        title="Example AI | Voice infrastructure",
+        markdown=markdown,
+        visible_text="Example AI Features Real-time voice agents",
+        links=links or [],
+        metadata={"description": "AI voice infrastructure for businesses"},
+        fetched_at=datetime.now(UTC),
+        crawler_used="fake",
+    )
+
+
+class FakeWebsiteCrawler:
+    def __init__(
+        self,
+        *,
+        pages: list[CrawlPageResult] | None = None,
+        errors: list[CrawlError] | None = None,
+    ) -> None:
+        self.pages = pages if pages is not None else [crawl_page()]
+        self.errors = errors or []
+        self.requests: list[CrawlRequest] = []
+
+    async def crawl(self, request: CrawlRequest) -> CrawlResult:
+        self.requests.append(request)
+        now = datetime.now(UTC)
+        return CrawlResult(
+            pages=self.pages,
+            errors=self.errors,
+            started_at=now,
+            completed_at=now,
+        )

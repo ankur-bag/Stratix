@@ -24,3 +24,16 @@ def test_settings_reject_invalid_api_prefix() -> None:
 def test_settings_reject_disabled_authentication_in_production() -> None:
     with pytest.raises(ValidationError, match="AUTH_DISABLED"):
         Settings(app_env="production", auth_disabled=True, _env_file=None)
+
+
+def test_settings_validate_safe_crawler_bounds() -> None:
+    with pytest.raises(ValidationError):
+        Settings(crawler_max_pages=101, _env_file=None)
+    with pytest.raises(ValidationError):
+        Settings(crawler_max_concurrency_per_domain=2, _env_file=None)
+    with pytest.raises(ValidationError):
+        Settings(
+            crawler_min_delay_seconds=8,
+            crawler_max_delay_seconds=4,
+            _env_file=None,
+        )
