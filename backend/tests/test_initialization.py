@@ -11,7 +11,7 @@ from app.services.extraction import (
     DeterministicCompanyIntelligenceExtractor,
     IntelligenceExtractionError,
 )
-from app.services.initialization import CompanyInitializationRunner
+from app.services.initialization import CompanyInitializationRunner, DiscoveryStarter
 from app.services.normalization import ContentNormalizer
 from app.services.onboarding import CompanyOnboardingService
 from tests.fakes import (
@@ -42,6 +42,7 @@ def runner(
     *,
     crawler: FakeWebsiteCrawler | None = None,
     extractor: CompanyIntelligenceExtractor | None = None,
+    discovery_starter: DiscoveryStarter | None = None,
 ) -> CompanyInitializationRunner:
     graph = CompanyInitializationGraph(
         persistence=persistence,
@@ -55,7 +56,7 @@ def runner(
             _env_file=None,
         ),
     )
-    return CompanyInitializationRunner(persistence, graph)
+    return CompanyInitializationRunner(persistence, graph, discovery_starter)
 
 
 class FailingExtractor:
@@ -63,6 +64,19 @@ class FailingExtractor:
         self, *, company_profile: object, snapshots: list[Snapshot]
     ) -> CompanyIntelligenceProfile:
         raise IntelligenceExtractionError
+
+
+class RecordingDiscoveryStarter:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def start_auto(
+        self, *, organization_id: str, company_profile_id: str, requested_by_user_id: str
+    ) -> None:
+        self.calls.append((organization_id, company_profile_id, requested_by_user_id))
+        if self.fail:
+            raise RuntimeError
 
 
 def test_runner_completes_deterministic_transitions(
@@ -99,6 +113,23 @@ def test_runner_completes_deterministic_transitions(
     assert job.snapshot_count == 1
     assert len(persistence.snapshots.items) == 1
     assert len(persistence.company_intelligence_profiles.items) == 1
+
+
+def test_runner_auto_starts_discovery_without_coupling_its_failure(
+    persistence: InMemoryPersistence,
+) -> None:
+    company_id, job_id = create_submission(persistence)
+    starter = RecordingDiscoveryStarter(fail=True)
+
+    asyncio.run(
+        runner(persistence, discovery_starter=starter).run(
+            job_id=job_id, organization_id="org_test"
+        )
+    )
+
+    assert starter.calls == [("org_test", company_id, "user_test")]
+    assert persistence.initialization_jobs.items[job_id].status == JobStatus.SUCCEEDED
+    assert persistence.company_profiles.items[company_id].onboarding_status == "ready"
 
 
 def test_runner_records_safe_failure_transitions(

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Request, status
 from pydantic import BaseModel
 
 from app.api.errors import AppError, ErrorEnvelope
+from app.core.config import Settings
 from app.repositories.interfaces import Persistence
 
 
@@ -35,6 +36,13 @@ async def live() -> HealthResponse:
 async def ready(request: Request) -> HealthResponse:
     """Confirm that all currently required dependencies are initialized."""
     persistence = cast(Persistence, request.app.state.persistence)
+    settings = cast(Settings, request.app.state.settings)
+    if settings.app_env == "production" and not settings.clerk_verification_configured:
+        raise AppError(
+            code="AUTH_CONFIGURATION_INVALID",
+            message="Authentication is not configured for this deployment.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
     if not request.app.state.ready or not await persistence.ping():
         raise AppError(
             code="DATABASE_UNAVAILABLE",

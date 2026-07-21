@@ -27,6 +27,23 @@ class Settings(BaseSettings):
     auth_disabled: bool = False
     dev_user_id: str = "user_development"
     dev_organization_id: str = "org_development"
+    clerk_secret_key: str | None = None
+    clerk_jwt_key: str | None = None
+    clerk_authorized_parties: list[str] = ["http://localhost:3000"]
+    clerk_require_organization: bool = True
+    frontend_allowed_origins: list[str] = ["http://localhost:3000"]
+    docs_enabled: bool = True
+    auto_start_competitor_discovery: bool = True
+    discovery_max_queries: int = 8
+    discovery_max_results_per_query: int = 8
+    discovery_category_weight: float = 0.22
+    discovery_use_case_weight: float = 0.18
+    discovery_segment_weight: float = 0.12
+    discovery_keyword_weight: float = 0.14
+    discovery_frequency_weight: float = 0.12
+    discovery_provider_score_weight: float = 0.12
+    discovery_known_competitor_weight: float = 0.10
+    tavily_api_key: str | None = None
     crawler_user_agent: str = "StratixBot/0.1"
     crawler_max_depth: int = 2
     crawler_max_pages: int = 15
@@ -44,7 +61,15 @@ class Settings(BaseSettings):
         """Prevent the development identity from being enabled in production."""
         if self.app_env == "production" and self.auth_disabled:
             raise ValueError("AUTH_DISABLED cannot be true in production")
+        if self.app_env == "production" and "*" in self.frontend_allowed_origins:
+            raise ValueError("FRONTEND_ALLOWED_ORIGINS cannot contain '*' in production")
         return self
+
+    @property
+    def clerk_verification_configured(self) -> bool:
+        """Return whether Clerk can verify sessions for this deployment."""
+        has_verification_key = bool(self.clerk_jwt_key or self.clerk_secret_key)
+        return has_verification_key and bool(self.clerk_authorized_parties)
 
     @field_validator("api_v1_prefix")
     @classmethod
@@ -78,6 +103,21 @@ class Settings(BaseSettings):
             raise ValueError("Configuration values must not be blank")
         return value.strip()
 
+    @field_validator("clerk_secret_key", "clerk_jwt_key", "tavily_api_key", mode="before")
+    @classmethod
+    def normalize_optional_secrets(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("clerk_authorized_parties", "frontend_allowed_origins")
+    @classmethod
+    def validate_origins(cls, values: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(value.strip().rstrip("/") for value in values))
+        if any(not value.startswith(("http://", "https://")) for value in normalized):
+            raise ValueError("Configured origins must use HTTP or HTTPS")
+        return normalized
+
     @field_validator("mongodb_connect_timeout_ms", "mongodb_server_selection_timeout_ms")
     @classmethod
     def validate_positive_timeout(cls, value: int) -> int:
@@ -98,6 +138,13 @@ class Settings(BaseSettings):
             raise ValueError("Crawler limits must be positive")
         return value
 
+    @field_validator("discovery_max_queries", "discovery_max_results_per_query")
+    @classmethod
+    def validate_discovery_bounds(cls, value: int) -> int:
+        if not 1 <= value <= 20:
+            raise ValueError("Discovery query and result limits must be between 1 and 20")
+        return value
+
     @field_validator("crawler_max_retries")
     @classmethod
     def validate_retry_limit(cls, value: int) -> int:
@@ -115,6 +162,21 @@ class Settings(BaseSettings):
             raise ValueError("CRAWLER_MIN_DELAY_SECONDS cannot be negative")
         if self.crawler_max_delay_seconds < self.crawler_min_delay_seconds:
             raise ValueError("Crawler maximum delay must be at least the minimum delay")
+        return self
+
+    @model_validator(mode="after")
+    def validate_discovery_weights(self) -> "Settings":
+        weights = (
+            self.discovery_category_weight,
+            self.discovery_use_case_weight,
+            self.discovery_segment_weight,
+            self.discovery_keyword_weight,
+            self.discovery_frequency_weight,
+            self.discovery_provider_score_weight,
+            self.discovery_known_competitor_weight,
+        )
+        if any(weight < 0 for weight in weights) or abs(sum(weights) - 1.0) > 0.0001:
+            raise ValueError("Discovery score weights must be non-negative and sum to 1")
         return self
 
 

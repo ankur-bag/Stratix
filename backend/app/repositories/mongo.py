@@ -7,6 +7,16 @@ from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from app.core.config import Settings
+from app.domain.discovery import (
+    CandidateStatus,
+    Competitor,
+    CompetitorCandidate,
+    CompetitorSource,
+    DiscoveryJob,
+    DiscoveryJobStatus,
+    DiscoveryStage,
+    RelationshipType,
+)
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
 from app.domain.onboarding import (
     CompanyProfile,
@@ -43,7 +53,11 @@ def _document(
     | InitializationJob
     | IdempotencyRecord
     | Snapshot
-    | CompanyIntelligenceProfile,
+    | CompanyIntelligenceProfile
+    | DiscoveryJob
+    | CompetitorCandidate
+    | Competitor
+    | CompetitorSource,
 ) -> Document:
     if isinstance(model, CompanyProfile):
         return company_document(model)
@@ -456,6 +470,342 @@ class MongoCompanyIntelligenceRepository:
         )
 
 
+class MongoDiscoveryJobRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, job: DiscoveryJob) -> DiscoveryJob:
+        try:
+            await self._collection.insert_one(_document(job))
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return job
+
+    async def get_by_id(self, organization_id: str, job_id: str) -> DiscoveryJob | None:
+        document = await _mongo(
+            self._collection.find_one({"_id": job_id, "organization_id": organization_id})
+        )
+        return cast(DiscoveryJob, model_from_document(DiscoveryJob, document)) if document else None
+
+    async def get_by_idempotency_key(
+        self, organization_id: str, idempotency_key: str
+    ) -> DiscoveryJob | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {"organization_id": organization_id, "idempotency_key": idempotency_key}
+            )
+        )
+        return cast(DiscoveryJob, model_from_document(DiscoveryJob, document)) if document else None
+
+    async def get_latest_for_company(
+        self, organization_id: str, company_profile_id: str
+    ) -> DiscoveryJob | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "company_profile_id": company_profile_id,
+                },
+                sort=[("created_at", DESCENDING)],
+            )
+        )
+        return cast(DiscoveryJob, model_from_document(DiscoveryJob, document)) if document else None
+
+    async def get_active_for_company(
+        self, organization_id: str, company_profile_id: str
+    ) -> DiscoveryJob | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "company_profile_id": company_profile_id,
+                    "status": {"$in": [DiscoveryJobStatus.QUEUED, DiscoveryJobStatus.RUNNING]},
+                },
+                sort=[("created_at", DESCENDING)],
+            )
+        )
+        return cast(DiscoveryJob, model_from_document(DiscoveryJob, document)) if document else None
+
+    async def mark_running(self, organization_id: str, job_id: str) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {"status": DiscoveryJobStatus.RUNNING, "started_at": utc_now()},
+        )
+
+    async def set_queries(
+        self, organization_id: str, job_id: str, queries: list[str]
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id, job_id, {"queries": queries, "query_count": len(queries)}
+        )
+
+    async def update_progress(
+        self,
+        organization_id: str,
+        job_id: str,
+        stage: DiscoveryStage,
+        progress_percent: int,
+        message: str,
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {"stage": stage, "progress_percent": progress_percent, "message": message},
+        )
+
+    async def mark_awaiting_review(
+        self,
+        organization_id: str,
+        job_id: str,
+        *,
+        candidate_count: int,
+        provider_error_count: int,
+        partial: bool,
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {
+                "status": (
+                    DiscoveryJobStatus.PARTIALLY_SUCCEEDED
+                    if partial
+                    else DiscoveryJobStatus.SUCCEEDED
+                ),
+                "stage": DiscoveryStage.AWAITING_USER_REVIEW,
+                "progress_percent": 100,
+                "message": (
+                    "Discovery completed with partial search coverage. Review the candidates."
+                    if partial
+                    else "Discovery is complete. Review the candidates."
+                ),
+                "candidate_count": candidate_count,
+                "provider_error_count": provider_error_count,
+                "completed_at": utc_now(),
+            },
+        )
+
+    async def mark_failed(
+        self, organization_id: str, job_id: str, error_code: str, error_message: str
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {
+                "status": DiscoveryJobStatus.FAILED,
+                "stage": DiscoveryStage.FAILED,
+                "message": error_message,
+                "error_code": error_code,
+                "error_message": error_message,
+                "completed_at": utc_now(),
+            },
+        )
+
+    async def update_review_counts(
+        self, organization_id: str, job_id: str, accepted: int, rejected: int
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {"accepted_count": accepted, "rejected_count": rejected},
+        )
+
+    async def _update(
+        self, organization_id: str, job_id: str, changes: Mapping[str, Any]
+    ) -> DiscoveryJob | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"_id": job_id, "organization_id": organization_id},
+                {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return cast(DiscoveryJob, model_from_document(DiscoveryJob, document)) if document else None
+
+
+class MongoCompetitorCandidateRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create_many(self, candidates: list[CompetitorCandidate]) -> list[CompetitorCandidate]:
+        if not candidates:
+            return []
+        try:
+            await self._collection.insert_many([_document(item) for item in candidates])
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return candidates
+
+    async def get_by_id(
+        self, organization_id: str, candidate_id: str
+    ) -> CompetitorCandidate | None:
+        document = await _mongo(
+            self._collection.find_one({"_id": candidate_id, "organization_id": organization_id})
+        )
+        return (
+            cast(CompetitorCandidate, model_from_document(CompetitorCandidate, document))
+            if document
+            else None
+        )
+
+    async def list(
+        self,
+        organization_id: str,
+        *,
+        candidate_status: CandidateStatus | None,
+        relationship_type: RelationshipType | None,
+        minimum_score: float,
+        discovery_job_id: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[CompetitorCandidate]:
+        query: dict[str, Any] = {
+            "organization_id": organization_id,
+            "similarity_score": {"$gte": minimum_score},
+        }
+        if candidate_status is not None:
+            query["status"] = candidate_status
+        if relationship_type is not None:
+            query["relationship_type"] = relationship_type
+        if discovery_job_id is not None:
+            query["discovery_job_id"] = discovery_job_id
+        if cursor is not None:
+            cursor_document = await _mongo(
+                self._collection.find_one({"_id": cursor, "organization_id": organization_id})
+            )
+            if cursor_document:
+                query["$or"] = [
+                    {"rank": {"$gt": cursor_document["rank"]}},
+                    {"rank": cursor_document["rank"], "_id": {"$gt": cursor}},
+                ]
+        documents = await _mongo(
+            self._collection.find(query)
+            .sort([("rank", ASCENDING), ("_id", ASCENDING)])
+            .to_list(length=limit)
+        )
+        return [
+            cast(CompetitorCandidate, model_from_document(CompetitorCandidate, item))
+            for item in documents
+        ]
+
+    async def mark_reviewed(
+        self,
+        organization_id: str,
+        candidate_id: str,
+        candidate_status: CandidateStatus,
+        user_id: str,
+    ) -> CompetitorCandidate | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"_id": candidate_id, "organization_id": organization_id},
+                {
+                    "$set": {
+                        "status": candidate_status,
+                        "reviewed_at": utc_now(),
+                        "reviewed_by_user_id": user_id,
+                        "updated_at": utc_now(),
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return (
+            cast(CompetitorCandidate, model_from_document(CompetitorCandidate, document))
+            if document
+            else None
+        )
+
+    async def count_reviews(self, organization_id: str, discovery_job_id: str) -> tuple[int, int]:
+        accepted = await _mongo(
+            self._collection.count_documents(
+                {
+                    "organization_id": organization_id,
+                    "discovery_job_id": discovery_job_id,
+                    "status": CandidateStatus.APPROVED,
+                }
+            )
+        )
+        rejected = await _mongo(
+            self._collection.count_documents(
+                {
+                    "organization_id": organization_id,
+                    "discovery_job_id": discovery_job_id,
+                    "status": CandidateStatus.REJECTED,
+                }
+            )
+        )
+        return accepted, rejected
+
+
+class MongoCompetitorRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, competitor: Competitor) -> Competitor:
+        try:
+            await self._collection.insert_one(_document(competitor))
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return competitor
+
+    async def get_by_candidate(self, organization_id: str, candidate_id: str) -> Competitor | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {"organization_id": organization_id, "candidate_id": candidate_id}
+            )
+        )
+        return cast(Competitor, model_from_document(Competitor, document)) if document else None
+
+    async def get_by_domain(self, organization_id: str, canonical_domain: str) -> Competitor | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {"organization_id": organization_id, "canonical_domain": canonical_domain}
+            )
+        )
+        return cast(Competitor, model_from_document(Competitor, document)) if document else None
+
+    async def list(self, organization_id: str, *, limit: int) -> list[Competitor]:
+        documents = await _mongo(
+            self._collection.find({"organization_id": organization_id})
+            .sort("created_at", DESCENDING)
+            .to_list(length=limit)
+        )
+        return [cast(Competitor, model_from_document(Competitor, item)) for item in documents]
+
+
+class MongoCompetitorSourceRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, source: CompetitorSource) -> CompetitorSource:
+        try:
+            await self._collection.insert_one(_document(source))
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return source
+
+    async def list_for_competitor(
+        self, organization_id: str, competitor_id: str
+    ) -> list[CompetitorSource]:
+        documents = await _mongo(
+            self._collection.find(
+                {"organization_id": organization_id, "competitor_id": competitor_id}
+            ).to_list(length=100)
+        )
+        return [
+            cast(CompetitorSource, model_from_document(CompetitorSource, item))
+            for item in documents
+        ]
+
+
 class MongoPersistence:
     """Own the PyMongo client lifecycle, repositories, and collection indexes."""
 
@@ -469,6 +819,10 @@ class MongoPersistence:
         self.idempotency_records: MongoIdempotencyRepository
         self.snapshots: MongoSnapshotRepository
         self.company_intelligence_profiles: MongoCompanyIntelligenceRepository
+        self.discovery_jobs: MongoDiscoveryJobRepository
+        self.competitor_candidates: MongoCompetitorCandidateRepository
+        self.competitors: MongoCompetitorRepository
+        self.competitor_sources: MongoCompetitorSourceRepository
 
     async def start(self) -> None:
         self._client = AsyncMongoClient(
@@ -487,6 +841,16 @@ class MongoPersistence:
         self.snapshots = MongoSnapshotRepository(self._database["snapshots"])
         self.company_intelligence_profiles = MongoCompanyIntelligenceRepository(
             self._database["company_intelligence_profiles"]
+        )
+        self.discovery_jobs = MongoDiscoveryJobRepository(
+            self._database["competitor_discovery_jobs"]
+        )
+        self.competitor_candidates = MongoCompetitorCandidateRepository(
+            self._database["competitor_candidates"]
+        )
+        self.competitors = MongoCompetitorRepository(self._database["competitors"])
+        self.competitor_sources = MongoCompetitorSourceRepository(
+            self._database["competitor_sources"]
         )
         if await self.ping():
             await self._create_indexes()
@@ -571,6 +935,66 @@ class MongoPersistence:
             intelligence = self._database["company_intelligence_profiles"]
             await intelligence.create_index(
                 [("organization_id", ASCENDING), ("company_profile_id", ASCENDING)],
+                unique=True,
+            )
+            discovery_jobs = self._database["competitor_discovery_jobs"]
+            await discovery_jobs.create_index(
+                [("organization_id", ASCENDING), ("created_at", ASCENDING)]
+            )
+            await discovery_jobs.create_index(
+                [("organization_id", ASCENDING), ("status", ASCENDING)]
+            )
+            await discovery_jobs.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("company_profile_id", ASCENDING),
+                    ("status", ASCENDING),
+                ]
+            )
+            await discovery_jobs.create_index(
+                [("organization_id", ASCENDING), ("idempotency_key", ASCENDING)],
+                unique=True,
+            )
+            candidates = self._database["competitor_candidates"]
+            await candidates.create_index(
+                [("organization_id", ASCENDING), ("discovery_job_id", ASCENDING)]
+            )
+            await candidates.create_index(
+                [("organization_id", ASCENDING), ("status", ASCENDING), ("rank", ASCENDING)]
+            )
+            await candidates.create_index(
+                [("organization_id", ASCENDING), ("canonical_domain", ASCENDING)]
+            )
+            await candidates.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("discovery_job_id", ASCENDING),
+                    ("canonical_domain", ASCENDING),
+                ],
+                unique=True,
+            )
+            competitors = self._database["competitors"]
+            await competitors.create_index(
+                [("organization_id", ASCENDING), ("created_at", ASCENDING)]
+            )
+            await competitors.create_index([("organization_id", ASCENDING), ("status", ASCENDING)])
+            await competitors.create_index(
+                [("organization_id", ASCENDING), ("canonical_domain", ASCENDING)],
+                unique=True,
+            )
+            await competitors.create_index(
+                [("organization_id", ASCENDING), ("candidate_id", ASCENDING)], unique=True
+            )
+            competitor_sources = self._database["competitor_sources"]
+            await competitor_sources.create_index(
+                [("organization_id", ASCENDING), ("competitor_id", ASCENDING)]
+            )
+            await competitor_sources.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("url", ASCENDING),
+                ],
                 unique=True,
             )
         except PyMongoError as exc:

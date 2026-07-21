@@ -12,6 +12,14 @@ class InitializationRunner(Protocol):
     async def run(self, *, job_id: str, organization_id: str) -> None: ...
 
 
+class DiscoveryStarter(Protocol):
+    """Optional boundary for starting discovery after successful initialization."""
+
+    async def start_auto(
+        self, *, organization_id: str, company_profile_id: str, requested_by_user_id: str
+    ) -> None: ...
+
+
 class BackgroundExecutor(Protocol):
     """Replaceable boundary for scheduling persisted initialization jobs."""
 
@@ -22,20 +30,36 @@ class BackgroundExecutor(Protocol):
 class CompanyInitializationRunner:
     """Execute the typed Phase 2 company intelligence graph."""
 
-    def __init__(self, persistence: Persistence, graph: CompanyInitializationGraph) -> None:
+    def __init__(
+        self,
+        persistence: Persistence,
+        graph: CompanyInitializationGraph,
+        discovery_starter: DiscoveryStarter | None = None,
+    ) -> None:
         self._persistence = persistence
         self._graph = graph
+        self._discovery_starter = discovery_starter
 
     async def run(self, *, job_id: str, organization_id: str) -> None:
         job = await self._persistence.initialization_jobs.get_by_id(organization_id, job_id)
         if job is None:
             return
         try:
-            await self._graph.run(
+            result = await self._graph.run(
                 job_id=job_id,
                 organization_id=organization_id,
                 company_profile_id=job.company_profile_id,
             )
+            if result["status"] == "completed" and self._discovery_starter is not None:
+                try:
+                    await self._discovery_starter.start_auto(
+                        organization_id=organization_id,
+                        company_profile_id=job.company_profile_id,
+                        requested_by_user_id=job.requested_by_user_id,
+                    )
+                except Exception:
+                    # Discovery is an independent job and cannot invalidate a ready company.
+                    return
         except Exception:
             await self._persistence.initialization_jobs.mark_failed(
                 organization_id,

@@ -22,15 +22,22 @@ def background_executor() -> RecordingBackgroundExecutor:
 
 
 @pytest.fixture
+def discovery_background_executor() -> RecordingBackgroundExecutor:
+    return RecordingBackgroundExecutor()
+
+
+@pytest.fixture
 def application(
     persistence: InMemoryPersistence,
     background_executor: RecordingBackgroundExecutor,
+    discovery_background_executor: RecordingBackgroundExecutor,
 ) -> FastAPI:
     settings = Settings(app_env="testing", app_debug=False, _env_file=None)
     app = create_app(
         settings,
         persistence=persistence,
         background_executor=background_executor,
+        discovery_background_executor=discovery_background_executor,
         crawler=FakeWebsiteCrawler(),
     )
 

@@ -8,6 +8,16 @@ from app.crawlers.models import (
     CrawlRequest,
     CrawlResult,
 )
+from app.domain.discovery import (
+    CandidateStatus,
+    Competitor,
+    CompetitorCandidate,
+    CompetitorSource,
+    DiscoveryJob,
+    DiscoveryJobStatus,
+    DiscoveryStage,
+    RelationshipType,
+)
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
 from app.domain.onboarding import (
     CompanyProfile,
@@ -341,6 +351,307 @@ class InMemoryCompanyIntelligenceRepository:
         )
 
 
+class InMemoryDiscoveryJobRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, DiscoveryJob] = {}
+
+    async def create(self, job: DiscoveryJob) -> DiscoveryJob:
+        if any(
+            item.organization_id == job.organization_id
+            and item.idempotency_key == job.idempotency_key
+            for item in self.items.values()
+        ):
+            raise RepositoryConflictError
+        self.items[job.id] = job
+        return job
+
+    async def get_by_id(self, organization_id: str, job_id: str) -> DiscoveryJob | None:
+        item = self.items.get(job_id)
+        return item if item and item.organization_id == organization_id else None
+
+    async def get_by_idempotency_key(
+        self, organization_id: str, idempotency_key: str
+    ) -> DiscoveryJob | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def get_latest_for_company(
+        self, organization_id: str, company_profile_id: str
+    ) -> DiscoveryJob | None:
+        matches = [
+            item
+            for item in self.items.values()
+            if item.organization_id == organization_id
+            and item.company_profile_id == company_profile_id
+        ]
+        return max(matches, key=lambda item: item.created_at) if matches else None
+
+    async def get_active_for_company(
+        self, organization_id: str, company_profile_id: str
+    ) -> DiscoveryJob | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.company_profile_id == company_profile_id
+                and item.status in {DiscoveryJobStatus.QUEUED, DiscoveryJobStatus.RUNNING}
+            ),
+            None,
+        )
+
+    async def mark_running(self, organization_id: str, job_id: str) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {"status": DiscoveryJobStatus.RUNNING, "started_at": utc_now()},
+        )
+
+    async def set_queries(
+        self, organization_id: str, job_id: str, queries: list[str]
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id, job_id, {"queries": queries, "query_count": len(queries)}
+        )
+
+    async def update_progress(
+        self,
+        organization_id: str,
+        job_id: str,
+        stage: DiscoveryStage,
+        progress_percent: int,
+        message: str,
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {"stage": stage, "progress_percent": progress_percent, "message": message},
+        )
+
+    async def mark_awaiting_review(
+        self,
+        organization_id: str,
+        job_id: str,
+        *,
+        candidate_count: int,
+        provider_error_count: int,
+        partial: bool,
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {
+                "status": (
+                    DiscoveryJobStatus.PARTIALLY_SUCCEEDED
+                    if partial
+                    else DiscoveryJobStatus.SUCCEEDED
+                ),
+                "stage": DiscoveryStage.AWAITING_USER_REVIEW,
+                "progress_percent": 100,
+                "message": "Discovery is complete. Review the candidates.",
+                "candidate_count": candidate_count,
+                "provider_error_count": provider_error_count,
+                "completed_at": utc_now(),
+            },
+        )
+
+    async def mark_failed(
+        self, organization_id: str, job_id: str, error_code: str, error_message: str
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {
+                "status": DiscoveryJobStatus.FAILED,
+                "stage": DiscoveryStage.FAILED,
+                "message": error_message,
+                "error_code": error_code,
+                "error_message": error_message,
+                "completed_at": utc_now(),
+            },
+        )
+
+    async def update_review_counts(
+        self, organization_id: str, job_id: str, accepted: int, rejected: int
+    ) -> DiscoveryJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {"accepted_count": accepted, "rejected_count": rejected},
+        )
+
+    async def _update(
+        self, organization_id: str, job_id: str, changes: Mapping[str, Any]
+    ) -> DiscoveryJob | None:
+        item = await self.get_by_id(organization_id, job_id)
+        if item is None:
+            return None
+        updated = item.model_copy(update={**changes, "updated_at": utc_now()})
+        self.items[job_id] = updated
+        return updated
+
+
+class InMemoryCompetitorCandidateRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, CompetitorCandidate] = {}
+
+    async def create_many(self, candidates: list[CompetitorCandidate]) -> list[CompetitorCandidate]:
+        for candidate in candidates:
+            if any(
+                item.organization_id == candidate.organization_id
+                and item.discovery_job_id == candidate.discovery_job_id
+                and item.canonical_domain == candidate.canonical_domain
+                for item in self.items.values()
+            ):
+                raise RepositoryConflictError
+            self.items[candidate.id] = candidate
+        return candidates
+
+    async def get_by_id(
+        self, organization_id: str, candidate_id: str
+    ) -> CompetitorCandidate | None:
+        item = self.items.get(candidate_id)
+        return item if item and item.organization_id == organization_id else None
+
+    async def list(
+        self,
+        organization_id: str,
+        *,
+        candidate_status: CandidateStatus | None,
+        relationship_type: RelationshipType | None,
+        minimum_score: float,
+        discovery_job_id: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[CompetitorCandidate]:
+        items = sorted(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and (candidate_status is None or item.status == candidate_status)
+                and (relationship_type is None or item.relationship_type == relationship_type)
+                and item.similarity_score >= minimum_score
+                and (discovery_job_id is None or item.discovery_job_id == discovery_job_id)
+            ),
+            key=lambda item: (item.rank, item.id),
+        )
+        if cursor:
+            cursor_index = next(
+                (index for index, item in enumerate(items) if item.id == cursor), None
+            )
+            if cursor_index is not None:
+                items = items[cursor_index + 1 :]
+        return items[:limit]
+
+    async def mark_reviewed(
+        self,
+        organization_id: str,
+        candidate_id: str,
+        candidate_status: CandidateStatus,
+        user_id: str,
+    ) -> CompetitorCandidate | None:
+        item = await self.get_by_id(organization_id, candidate_id)
+        if item is None:
+            return None
+        updated = item.model_copy(
+            update={
+                "status": candidate_status,
+                "reviewed_at": utc_now(),
+                "reviewed_by_user_id": user_id,
+                "updated_at": utc_now(),
+            }
+        )
+        self.items[candidate_id] = updated
+        return updated
+
+    async def count_reviews(self, organization_id: str, discovery_job_id: str) -> tuple[int, int]:
+        matching = [
+            item
+            for item in self.items.values()
+            if item.organization_id == organization_id and item.discovery_job_id == discovery_job_id
+        ]
+        return (
+            sum(item.status == CandidateStatus.APPROVED for item in matching),
+            sum(item.status == CandidateStatus.REJECTED for item in matching),
+        )
+
+
+class InMemoryCompetitorRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, Competitor] = {}
+
+    async def create(self, competitor: Competitor) -> Competitor:
+        if any(
+            item.organization_id == competitor.organization_id
+            and item.canonical_domain == competitor.canonical_domain
+            for item in self.items.values()
+        ):
+            raise RepositoryConflictError
+        self.items[competitor.id] = competitor
+        return competitor
+
+    async def get_by_candidate(self, organization_id: str, candidate_id: str) -> Competitor | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id and item.candidate_id == candidate_id
+            ),
+            None,
+        )
+
+    async def get_by_domain(self, organization_id: str, canonical_domain: str) -> Competitor | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.canonical_domain == canonical_domain
+            ),
+            None,
+        )
+
+    async def list(self, organization_id: str, *, limit: int) -> list[Competitor]:
+        return sorted(
+            (item for item in self.items.values() if item.organization_id == organization_id),
+            key=lambda item: item.created_at,
+            reverse=True,
+        )[:limit]
+
+
+class InMemoryCompetitorSourceRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, CompetitorSource] = {}
+
+    async def create(self, source: CompetitorSource) -> CompetitorSource:
+        if any(
+            item.organization_id == source.organization_id
+            and item.competitor_id == source.competitor_id
+            and item.url == source.url
+            for item in self.items.values()
+        ):
+            raise RepositoryConflictError
+        self.items[source.id] = source
+        return source
+
+    async def list_for_competitor(
+        self, organization_id: str, competitor_id: str
+    ) -> list[CompetitorSource]:
+        return [
+            item
+            for item in self.items.values()
+            if item.organization_id == organization_id and item.competitor_id == competitor_id
+        ]
+
+
 class InMemoryPersistence:
     def __init__(self, *, ready: bool = True) -> None:
         self.company_profiles = InMemoryCompanyProfileRepository()
@@ -349,6 +660,10 @@ class InMemoryPersistence:
         self.idempotency_records = InMemoryIdempotencyRepository()
         self.snapshots = InMemorySnapshotRepository()
         self.company_intelligence_profiles = InMemoryCompanyIntelligenceRepository()
+        self.discovery_jobs = InMemoryDiscoveryJobRepository()
+        self.competitor_candidates = InMemoryCompetitorCandidateRepository()
+        self.competitors = InMemoryCompetitorRepository()
+        self.competitor_sources = InMemoryCompetitorSourceRepository()
         self.ready = ready
         self.started = False
         self.closed = False

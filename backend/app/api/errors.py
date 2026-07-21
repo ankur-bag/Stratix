@@ -88,7 +88,11 @@ def register_error_handlers(application: FastAPI) -> None:
     async def handle_validation_error(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        if any(error.get("loc", ())[-1:] == ("website_url",) for error in exc.errors()):
+        validation_errors = [
+            {key: value for key, value in error.items() if key not in {"ctx", "input", "url"}}
+            for error in exc.errors()
+        ]
+        if any(error.get("loc", ())[-1:] == ("website_url",) for error in validation_errors):
             return error_response(
                 request=request,
                 status_code=422,
@@ -100,7 +104,7 @@ def register_error_handlers(application: FastAPI) -> None:
             status_code=422,
             code="REQUEST_VALIDATION_ERROR",
             message="The request could not be validated.",
-            details={"errors": exc.errors()},
+            details={"errors": validation_errors},
         )
 
     @application.exception_handler(HTTPException)
