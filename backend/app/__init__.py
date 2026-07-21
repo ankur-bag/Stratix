@@ -1,0 +1,1 @@
+"""Stratix backend application package."""

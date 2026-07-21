@@ -1,0 +1,42 @@
+from typing import Literal
+
+from fastapi import APIRouter, Request, status
+from pydantic import BaseModel
+
+from app.api.errors import AppError, ErrorEnvelope
+
+
+class HealthResponse(BaseModel):
+    """Health endpoint response."""
+
+    status: Literal["alive", "ready"]
+
+
+router = APIRouter(prefix="/health", tags=["health"])
+
+
+@router.get("/live", response_model=HealthResponse)
+async def live() -> HealthResponse:
+    """Confirm that the API process can serve requests."""
+    return HealthResponse(status="alive")
+
+
+@router.get(
+    "/ready",
+    response_model=HealthResponse,
+    responses={
+        503: {
+            "description": "Application startup is incomplete",
+            "model": ErrorEnvelope,
+        }
+    },
+)
+async def ready(request: Request) -> HealthResponse:
+    """Confirm that all currently required dependencies are initialized."""
+    if not request.app.state.ready:
+        raise AppError(
+            code="SERVICE_NOT_READY",
+            message="The service is not ready to accept requests.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return HealthResponse(status="ready")
