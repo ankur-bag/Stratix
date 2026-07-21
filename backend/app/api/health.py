@@ -1,9 +1,10 @@
-from typing import Literal
+from typing import Literal, cast
 
 from fastapi import APIRouter, Request, status
 from pydantic import BaseModel
 
 from app.api.errors import AppError, ErrorEnvelope
+from app.repositories.interfaces import Persistence
 
 
 class HealthResponse(BaseModel):
@@ -33,10 +34,11 @@ async def live() -> HealthResponse:
 )
 async def ready(request: Request) -> HealthResponse:
     """Confirm that all currently required dependencies are initialized."""
-    if not request.app.state.ready:
+    persistence = cast(Persistence, request.app.state.persistence)
+    if not request.app.state.ready or not await persistence.ping():
         raise AppError(
-            code="SERVICE_NOT_READY",
-            message="The service is not ready to accept requests.",
+            code="DATABASE_UNAVAILABLE",
+            message="The database is temporarily unavailable.",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
     return HealthResponse(status="ready")

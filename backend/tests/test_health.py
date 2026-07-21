@@ -2,6 +2,10 @@ from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
+from app.core.config import Settings
+from app.main import create_app
+from tests.fakes import InMemoryPersistence, RecordingBackgroundExecutor
+
 
 def test_liveness(client: TestClient) -> None:
     response = client.get("/health/live")
@@ -38,3 +42,16 @@ def test_not_found_uses_stable_error_envelope(client: TestClient) -> None:
             "request_id": response.headers["X-Request-ID"],
         }
     }
+
+
+def test_readiness_reports_database_failure() -> None:
+    application = create_app(
+        Settings(app_env="testing", _env_file=None),
+        persistence=InMemoryPersistence(ready=False),
+        background_executor=RecordingBackgroundExecutor(),
+    )
+    with TestClient(application) as client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "DATABASE_UNAVAILABLE"

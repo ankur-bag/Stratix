@@ -88,6 +88,13 @@ def register_error_handlers(application: FastAPI) -> None:
     async def handle_validation_error(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        if any(error.get("loc", ())[-1:] == ("website_url",) for error in exc.errors()):
+            return error_response(
+                request=request,
+                status_code=422,
+                code="INVALID_WEBSITE_URL",
+                message="The website URL must identify a valid public HTTP(S) destination.",
+            )
         return error_response(
             request=request,
             status_code=422,

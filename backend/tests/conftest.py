@@ -1,15 +1,47 @@
 from collections.abc import Iterator
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.api.dependencies import get_authenticated_context
+from app.core.auth import AuthenticatedContext
 from app.core.config import Settings
 from app.main import create_app
+from tests.fakes import InMemoryPersistence, RecordingBackgroundExecutor
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
-    """Provide an in-process client with no external service dependencies."""
+def persistence() -> InMemoryPersistence:
+    return InMemoryPersistence()
+
+
+@pytest.fixture
+def background_executor() -> RecordingBackgroundExecutor:
+    return RecordingBackgroundExecutor()
+
+
+@pytest.fixture
+def application(
+    persistence: InMemoryPersistence,
+    background_executor: RecordingBackgroundExecutor,
+) -> FastAPI:
     settings = Settings(app_env="testing", app_debug=False, _env_file=None)
-    with TestClient(create_app(settings)) as test_client:
+    app = create_app(
+        settings,
+        persistence=persistence,
+        background_executor=background_executor,
+    )
+
+    async def test_context() -> AuthenticatedContext:
+        return AuthenticatedContext(user_id="user_test", organization_id="org_test")
+
+    app.dependency_overrides[get_authenticated_context] = test_context
+    return app
+
+
+@pytest.fixture
+def client(application: FastAPI) -> Iterator[TestClient]:
+    """Provide an in-process client with no external service dependencies."""
+    with TestClient(application) as test_client:
         yield test_client

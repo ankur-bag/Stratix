@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +20,20 @@ class Settings(BaseSettings):
     app_debug: bool = False
     api_v1_prefix: str = "/api/v1"
     log_level: str = "INFO"
+    mongodb_uri: str = "mongodb://localhost:27017"
+    mongodb_database: str = "stratix"
+    mongodb_connect_timeout_ms: int = 5000
+    mongodb_server_selection_timeout_ms: int = 5000
+    auth_disabled: bool = False
+    dev_user_id: str = "user_development"
+    dev_organization_id: str = "org_development"
+
+    @model_validator(mode="after")
+    def reject_insecure_production_auth(self) -> "Settings":
+        """Prevent the development identity from being enabled in production."""
+        if self.app_env == "production" and self.auth_disabled:
+            raise ValueError("AUTH_DISABLED cannot be true in production")
+        return self
 
     @field_validator("api_v1_prefix")
     @classmethod
@@ -45,6 +59,20 @@ class Settings(BaseSettings):
         if not value.strip():
             raise ValueError("APP_NAME must not be empty")
         return value.strip()
+
+    @field_validator("mongodb_database", "dev_user_id", "dev_organization_id")
+    @classmethod
+    def validate_non_blank_settings(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Configuration values must not be blank")
+        return value.strip()
+
+    @field_validator("mongodb_connect_timeout_ms", "mongodb_server_selection_timeout_ms")
+    @classmethod
+    def validate_positive_timeout(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("MongoDB timeouts must be positive")
+        return value
 
 
 @lru_cache
