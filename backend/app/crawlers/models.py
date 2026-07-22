@@ -23,6 +23,10 @@ class CrawlRequest(BaseModel):
     source_id: str
     max_depth: int = Field(ge=0, le=5)
     max_pages: int = Field(ge=1, le=100)
+    max_retries: int | None = Field(default=None, ge=0, le=5)
+    page_timeout_ms: int | None = Field(default=None, gt=0)
+    max_response_bytes: int | None = Field(default=None, gt=0)
+    check_robots: bool | None = None
 
 
 class CrawlPageResult(BaseModel):
@@ -36,6 +40,8 @@ class CrawlPageResult(BaseModel):
     metadata: dict[str, str]
     fetched_at: datetime
     crawler_used: str
+    content_type: str | None = None
+    crawl_duration_ms: float = Field(default=0, ge=0)
 
 
 class CrawlError(BaseModel):

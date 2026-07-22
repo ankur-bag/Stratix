@@ -6,7 +6,7 @@ export default function DashboardPage() {
       <p className="text-sm font-medium text-zinc-500">Workspace overview</p>
       <h1 className="mt-2 text-3xl font-semibold tracking-tight sm:text-4xl">Your competitive set</h1>
       <p className="mt-3 max-w-2xl leading-7 text-zinc-600 dark:text-zinc-400">
-        Approved companies are ready for monitoring setup. Phase 3 does not collect competitor snapshots or display fabricated activity.
+        Track approved competitors through bounded public-source scans and objective, evidence-linked change signals.
       </p>
       <ApprovedCompetitors />
     </main>

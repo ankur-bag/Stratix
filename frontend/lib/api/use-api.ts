@@ -1,10 +1,24 @@
 "use client";
 
-import { useAuth } from "@clerk/nextjs";
+import { useAuth, useClerk, useOrganization } from "@clerk/nextjs";
 import { useMemo } from "react";
 import { ApiClient } from "@/lib/api/client";
 
 export function useAuthenticatedApi(): ApiClient {
   const { getToken } = useAuth();
-  return useMemo(() => new ApiClient(() => getToken()), [getToken]);
+  const clerk = useClerk();
+  const { organization } = useOrganization();
+  const activeOrganizationId = organization?.id ?? null;
+
+  return useMemo(
+    () =>
+      new ApiClient(
+        getToken,
+        undefined,
+        activeOrganizationId,
+        (requestedOrganizationId) =>
+          clerk.organization?.id === requestedOrganizationId,
+      ),
+    [activeOrganizationId, clerk, getToken],
+  );
 }

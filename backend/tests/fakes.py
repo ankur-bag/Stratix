@@ -12,13 +12,14 @@ from app.domain.discovery import (
     CandidateStatus,
     Competitor,
     CompetitorCandidate,
-    CompetitorSource,
     DiscoveryJob,
     DiscoveryJobStatus,
     DiscoveryStage,
     RelationshipType,
 )
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
+from app.domain.monitoring import CompetitorSource
+from app.domain.monitoring import SourceStatus as CompetitorSourceStatus
 from app.domain.onboarding import (
     CompanyProfile,
     IdempotencyRecord,
@@ -30,6 +31,8 @@ from app.domain.onboarding import (
     SourceStatus,
     utc_now,
 )
+from app.domain.scanning import CompetitorScanJob, CompetitorSnapshot, ScanStage, ScanStatus
+from app.domain.signals import CompetitorSignal, SignalStatus, SignalType
 from app.repositories.interfaces import RepositoryConflictError
 
 
@@ -619,6 +622,20 @@ class InMemoryCompetitorRepository:
             None,
         )
 
+    async def get_by_id(self, organization_id: str, competitor_id: str) -> Competitor | None:
+        item = self.items.get(competitor_id)
+        return item if item and item.organization_id == organization_id else None
+
+    async def update(
+        self, organization_id: str, competitor_id: str, changes: Mapping[str, object]
+    ) -> Competitor | None:
+        current = await self.get_by_id(organization_id, competitor_id)
+        if current is None:
+            return None
+        updated = current.model_copy(update={**changes, "updated_at": datetime.now(UTC)})
+        self.items[competitor_id] = updated
+        return updated
+
     async def list(self, organization_id: str, *, limit: int) -> list[Competitor]:
         return sorted(
             (item for item in self.items.values() if item.organization_id == organization_id),
@@ -635,7 +652,7 @@ class InMemoryCompetitorSourceRepository:
         if any(
             item.organization_id == source.organization_id
             and item.competitor_id == source.competitor_id
-            and item.url == source.url
+            and item.canonical_url == source.canonical_url
             for item in self.items.values()
         ):
             raise RepositoryConflictError
@@ -643,13 +660,314 @@ class InMemoryCompetitorSourceRepository:
         return source
 
     async def list_for_competitor(
-        self, organization_id: str, competitor_id: str
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+        enabled_only: bool = False,
     ) -> list[CompetitorSource]:
-        return [
-            item
+        items = sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.competitor_id == competitor_id
+                and (not enabled_only or item.enabled)
+                and (cursor is None or item.id > cursor)
+            ],
+            key=lambda item: item.id,
+        )
+        return items[:limit]
+
+    async def get_by_id(
+        self, organization_id: str, competitor_id: str, source_id: str
+    ) -> CompetitorSource | None:
+        item = self.items.get(source_id)
+        if (
+            item is None
+            or item.organization_id != organization_id
+            or item.competitor_id != competitor_id
+        ):
+            return None
+        return item
+
+    async def update(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        source_id: str,
+        changes: Mapping[str, object],
+    ) -> CompetitorSource | None:
+        current = await self.get_by_id(organization_id, competitor_id, source_id)
+        if current is None:
+            return None
+        updated = current.model_copy(update={**changes, "updated_at": datetime.now(UTC)})
+        self.items[source_id] = updated
+        return updated
+
+    async def set_status(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        source_id: str,
+        source_status: CompetitorSourceStatus,
+        *,
+        error_code: str | None = None,
+    ) -> CompetitorSource | None:
+        return await self.update(
+            organization_id,
+            competitor_id,
+            source_id,
+            {"status": source_status, "last_error_code": error_code},
+        )
+
+
+class InMemoryCompetitorScanRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, CompetitorScanJob] = {}
+
+    async def create(self, scan: CompetitorScanJob) -> CompetitorScanJob:
+        if any(
+            item.organization_id == scan.organization_id
+            and item.idempotency_key == scan.idempotency_key
             for item in self.items.values()
-            if item.organization_id == organization_id and item.competitor_id == competitor_id
-        ]
+        ):
+            raise RepositoryConflictError
+        self.items[scan.id] = scan
+        return scan
+
+    async def get_by_id(self, organization_id: str, scan_id: str) -> CompetitorScanJob | None:
+        item = self.items.get(scan_id)
+        return item if item and item.organization_id == organization_id else None
+
+    async def get_by_idempotency_key(
+        self, organization_id: str, idempotency_key: str
+    ) -> CompetitorScanJob | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def get_active_for_competitor(
+        self, organization_id: str, competitor_id: str
+    ) -> CompetitorScanJob | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.competitor_id == competitor_id
+                and item.status in {ScanStatus.QUEUED, ScanStatus.RUNNING}
+            ),
+            None,
+        )
+
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> list[CompetitorScanJob]:
+        items = sorted(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id and item.competitor_id == competitor_id
+            ),
+            key=lambda item: (item.created_at, item.id),
+            reverse=True,
+        )
+        if cursor is not None:
+            cursor_index = next(
+                (index for index, item in enumerate(items) if item.id == cursor), None
+            )
+            if cursor_index is not None:
+                items = items[cursor_index + 1 :]
+        return items[:limit]
+
+    async def update_progress(
+        self,
+        organization_id: str,
+        scan_id: str,
+        stage: ScanStage,
+        progress_percent: int,
+        message: str,
+        metrics: Mapping[str, int] | None = None,
+    ) -> CompetitorScanJob | None:
+        current = await self.get_by_id(organization_id, scan_id)
+        if current is None:
+            return None
+        updated = current.model_copy(
+            update={
+                "stage": stage,
+                "progress_percent": progress_percent,
+                "message": message,
+                "updated_at": utc_now(),
+                **dict(metrics or {}),
+            }
+        )
+        self.items[scan_id] = updated
+        return updated
+
+    async def mark_running(self, organization_id: str, scan_id: str) -> CompetitorScanJob | None:
+        current = await self.get_by_id(organization_id, scan_id)
+        if current is None:
+            return None
+        updated = current.model_copy(
+            update={"status": ScanStatus.RUNNING, "started_at": utc_now(), "updated_at": utc_now()}
+        )
+        self.items[scan_id] = updated
+        return updated
+
+    async def finalize(
+        self,
+        organization_id: str,
+        scan_id: str,
+        scan_status: ScanStatus,
+        *,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> CompetitorScanJob | None:
+        current = await self.get_by_id(organization_id, scan_id)
+        if current is None:
+            return None
+        stage = ScanStage.COMPLETED if scan_status != ScanStatus.FAILED else ScanStage.FAILED
+        updated = current.model_copy(
+            update={
+                "status": scan_status,
+                "stage": stage,
+                "progress_percent": 100,
+                "message": "Competitor scan completed."
+                if scan_status != ScanStatus.FAILED
+                else "The competitor scan could not be completed.",
+                "error_code": error_code,
+                "error_message": error_message,
+                "completed_at": utc_now(),
+                "updated_at": utc_now(),
+            }
+        )
+        self.items[scan_id] = updated
+        return updated
+
+
+class InMemoryCompetitorSnapshotRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, CompetitorSnapshot] = {}
+
+    async def create(self, snapshot: CompetitorSnapshot) -> CompetitorSnapshot:
+        if any(
+            item.organization_id == snapshot.organization_id
+            and item.scan_id == snapshot.scan_id
+            and item.source_id == snapshot.source_id
+            for item in self.items.values()
+        ):
+            raise RepositoryConflictError
+        self.items[snapshot.id] = snapshot
+        return snapshot
+
+    async def get_by_id(self, organization_id: str, snapshot_id: str) -> CompetitorSnapshot | None:
+        item = self.items.get(snapshot_id)
+        return item if item and item.organization_id == organization_id else None
+
+    async def get_latest_for_source(
+        self, organization_id: str, source_id: str
+    ) -> CompetitorSnapshot | None:
+        items = sorted(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id and item.source_id == source_id
+            ),
+            key=lambda item: (item.fetched_at, item.created_at, item.id),
+            reverse=True,
+        )
+        return items[0] if items else None
+
+    async def get_for_scan_source(
+        self, organization_id: str, scan_id: str, source_id: str
+    ) -> CompetitorSnapshot | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.scan_id == scan_id
+                and item.source_id == source_id
+            ),
+            None,
+        )
+
+
+class InMemoryCompetitorSignalRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, CompetitorSignal] = {}
+
+    async def create(self, signal: CompetitorSignal) -> CompetitorSignal:
+        self.items[signal.id] = signal
+        return signal
+
+    async def get_by_id(self, organization_id: str, signal_id: str) -> CompetitorSignal | None:
+        item = self.items.get(signal_id)
+        return item if item and item.organization_id == organization_id else None
+
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        signal_type: SignalType | None,
+        signal_status: SignalStatus | None,
+        minimum_importance: float,
+        source_id: str | None,
+        observed_after: datetime | None,
+        observed_before: datetime | None,
+        scan_id: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[CompetitorSignal]:
+        items = sorted(
+            (
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.competitor_id == competitor_id
+                and (signal_type is None or item.type == signal_type)
+                and (signal_status is None or item.status == signal_status)
+                and item.importance_score >= minimum_importance
+                and (source_id is None or item.source_id == source_id)
+                and (scan_id is None or item.scan_id == scan_id)
+                and (observed_after is None or item.observed_at >= observed_after)
+                and (observed_before is None or item.observed_at <= observed_before)
+            ),
+            key=lambda item: (item.observed_at, item.id),
+            reverse=True,
+        )
+        if cursor is not None:
+            cursor_index = next(
+                (index for index, item in enumerate(items) if item.id == cursor), None
+            )
+            if cursor_index is not None:
+                items = items[cursor_index + 1 :]
+        return items[:limit]
+
+    async def update_status(
+        self, organization_id: str, signal_id: str, signal_status: SignalStatus
+    ) -> CompetitorSignal | None:
+        current = await self.get_by_id(organization_id, signal_id)
+        if current is None:
+            return None
+        updated = current.model_copy(update={"status": signal_status})
+        self.items[signal_id] = updated
+        return updated
 
 
 class InMemoryPersistence:
@@ -664,6 +982,9 @@ class InMemoryPersistence:
         self.competitor_candidates = InMemoryCompetitorCandidateRepository()
         self.competitors = InMemoryCompetitorRepository()
         self.competitor_sources = InMemoryCompetitorSourceRepository()
+        self.competitor_scans = InMemoryCompetitorScanRepository()
+        self.competitor_snapshots = InMemoryCompetitorSnapshotRepository()
+        self.competitor_signals = InMemoryCompetitorSignalRepository()
         self.ready = ready
         self.started = False
         self.closed = False
@@ -684,6 +1005,17 @@ class RecordingBackgroundExecutor:
 
     def schedule(self, *, job_id: str, organization_id: str) -> None:
         self.scheduled.append((job_id, organization_id))
+
+    async def close(self) -> None:
+        return None
+
+
+class RecordingCompetitorScanExecutor:
+    def __init__(self) -> None:
+        self.scheduled: list[tuple[str, str]] = []
+
+    def schedule(self, *, scan_id: str, organization_id: str) -> None:
+        self.scheduled.append((scan_id, organization_id))
 
     async def close(self) -> None:
         return None

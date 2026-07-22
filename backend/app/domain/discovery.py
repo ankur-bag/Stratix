@@ -46,6 +46,24 @@ class CompetitorStatus(StrEnum):
     ARCHIVED = "archived"
 
 
+class MonitoringStatus(StrEnum):
+    PENDING = "pending"
+    INITIALIZING = "initializing"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    FAILED = "failed"
+    ARCHIVED = "archived"
+
+
+class BaselineStatus(StrEnum):
+    NOT_STARTED = "not_started"
+    DISCOVERING_SOURCES = "discovering_sources"
+    COLLECTING = "collecting"
+    READY = "ready"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
 class DiscoveryJob(BaseModel):
     id: str
     organization_id: str
@@ -125,18 +143,14 @@ class Competitor(BaseModel):
     updated_at: datetime
     approved_at: datetime
     approved_by_user_id: str
-
-
-class CompetitorSource(BaseModel):
-    id: str
-    organization_id: str
-    competitor_id: str
-    type: str = "website"
-    url: str
-    enabled: bool = True
-    status: str = "pending"
-    created_at: datetime
-    updated_at: datetime
+    monitoring_status: MonitoringStatus = MonitoringStatus.PENDING
+    baseline_status: BaselineStatus = BaselineStatus.NOT_STARTED
+    last_scan_at: datetime | None = None
+    last_successful_scan_at: datetime | None = None
+    next_scan_at: datetime | None = None
+    latest_scan_job_id: str | None = None
+    source_count: int = Field(default=0, ge=0)
+    signal_count: int = Field(default=0, ge=0)
 
 
 class DiscoveryJobSummary(BaseModel):

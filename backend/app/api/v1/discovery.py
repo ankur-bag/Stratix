@@ -86,3 +86,10 @@ async def review_candidates(
 @router.get("/competitors", response_model=list[Competitor])
 async def list_competitors(context: Authenticated, service: DiscoveryService) -> list[Competitor]:
     return await service.list_competitors(context)
+
+
+@router.get("/competitors/{competitor_id}", response_model=Competitor)
+async def get_competitor(
+    competitor_id: str, context: Authenticated, service: DiscoveryService
+) -> Competitor:
+    return await service.get_competitor(context, competitor_id)

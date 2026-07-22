@@ -82,6 +82,7 @@ class ClerkAuthenticationVerifier:
         jwt_key: str | None,
         authorized_parties: list[str],
         require_organization: bool,
+        clock_skew_ms: int = 5_000,
         client: ClerkClient | None = None,
     ) -> None:
         self._client = client or cast(ClerkClient, Clerk(bearer_auth=secret_key))
@@ -89,6 +90,7 @@ class ClerkAuthenticationVerifier:
             secret_key=secret_key,
             jwt_key=jwt_key,
             authorized_parties=authorized_parties,
+            clock_skew_in_ms=clock_skew_ms,
             accepts_token=["session_token"],
         )
         self._require_organization = require_organization

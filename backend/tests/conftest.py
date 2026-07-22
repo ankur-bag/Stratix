@@ -8,7 +8,12 @@ from app.api.dependencies import get_authenticated_context
 from app.core.auth import AuthenticatedContext
 from app.core.config import Settings
 from app.main import create_app
-from tests.fakes import FakeWebsiteCrawler, InMemoryPersistence, RecordingBackgroundExecutor
+from tests.fakes import (
+    FakeWebsiteCrawler,
+    InMemoryPersistence,
+    RecordingBackgroundExecutor,
+    RecordingCompetitorScanExecutor,
+)
 
 
 @pytest.fixture
@@ -27,10 +32,16 @@ def discovery_background_executor() -> RecordingBackgroundExecutor:
 
 
 @pytest.fixture
+def competitor_scan_executor() -> RecordingCompetitorScanExecutor:
+    return RecordingCompetitorScanExecutor()
+
+
+@pytest.fixture
 def application(
     persistence: InMemoryPersistence,
     background_executor: RecordingBackgroundExecutor,
     discovery_background_executor: RecordingBackgroundExecutor,
+    competitor_scan_executor: RecordingCompetitorScanExecutor,
 ) -> FastAPI:
     settings = Settings(app_env="testing", app_debug=False, _env_file=None)
     app = create_app(
@@ -39,6 +50,7 @@ def application(
         background_executor=background_executor,
         discovery_background_executor=discovery_background_executor,
         crawler=FakeWebsiteCrawler(),
+        competitor_scan_executor=competitor_scan_executor,
     )
 
     async def test_context() -> AuthenticatedContext:

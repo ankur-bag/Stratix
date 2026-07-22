@@ -26,10 +26,11 @@ class FakeClerkClient:
     def __init__(self, state: FakeRequestState | Exception) -> None:
         self.state = state
         self.requests: list[Request] = []
+        self.options: list[object] = []
 
     def authenticate_request(self, request: Request, options: object) -> FakeRequestState:
-        del options
         self.requests.append(request)
+        self.options.append(options)
         if isinstance(self.state, Exception):
             raise self.state
         return self.state
@@ -124,12 +125,14 @@ def test_valid_context_extracts_role_and_permissions() -> None:
             "org_permissions": ["org:competitors:manage", 42],
         },
     )
+    clerk_client = FakeClerkClient(state)
     verifier = ClerkAuthenticationVerifier(
         secret_key="sk_test_placeholder",
         jwt_key="public-key-placeholder",
         authorized_parties=["http://localhost:3000"],
         require_organization=True,
-        client=FakeClerkClient(state),
+        clock_skew_ms=10_000,
+        client=clerk_client,
     )
     request = Request(
         {
@@ -149,6 +152,7 @@ def test_valid_context_extracts_role_and_permissions() -> None:
         organization_role="org:member",
         organization_permissions=["org:competitors:manage"],
     )
+    assert clerk_client.options[0].clock_skew_in_ms == 10_000
 
 
 def test_development_auth_fallback_is_explicit() -> None:

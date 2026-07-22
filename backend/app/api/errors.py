@@ -99,6 +99,13 @@ def register_error_handlers(application: FastAPI) -> None:
                 code="INVALID_WEBSITE_URL",
                 message="The website URL must identify a valid public HTTP(S) destination.",
             )
+        if request.method == "PATCH" and request.url.path.startswith("/api/v1/signals/"):
+            return error_response(
+                request=request,
+                status_code=422,
+                code="INVALID_SIGNAL_STATUS",
+                message="Signal status may only be reviewed or dismissed.",
+            )
         return error_response(
             request=request,
             status_code=422,

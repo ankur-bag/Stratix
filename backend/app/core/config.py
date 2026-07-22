@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     clerk_secret_key: str | None = None
     clerk_jwt_key: str | None = None
     clerk_authorized_parties: list[str] = ["http://localhost:3000"]
+    clerk_clock_skew_ms: int = 10_000
     clerk_require_organization: bool = True
     frontend_allowed_origins: list[str] = ["http://localhost:3000"]
     docs_enabled: bool = True
@@ -54,6 +55,22 @@ class Settings(BaseSettings):
     crawler_page_timeout_ms: int = 45000
     crawler_max_response_bytes: int = 5_000_000
     crawler_check_robots: bool = True
+    auto_start_competitor_baseline: bool = True
+    competitor_crawler_max_sources: int = 12
+    competitor_crawler_max_depth: int = 1
+    competitor_crawler_max_pages_per_source: int = 1
+    competitor_crawler_max_concurrency_per_domain: int = 1
+    competitor_crawler_min_delay_seconds: float = 4
+    competitor_crawler_max_delay_seconds: float = 8
+    competitor_crawler_max_retries: int = 2
+    competitor_crawler_page_timeout_ms: int = 45000
+    competitor_crawler_max_response_bytes: int = 5_000_000
+    competitor_crawler_check_robots: bool = True
+    change_min_significance_score: float = 0.25
+    change_min_text_length: int = 20
+    change_ignore_navigation: bool = True
+    change_ignore_footer: bool = True
+    change_ignore_cookie_banners: bool = True
     llm_enabled: bool = False
 
     @model_validator(mode="after")
@@ -125,12 +142,26 @@ class Settings(BaseSettings):
             raise ValueError("MongoDB timeouts must be positive")
         return value
 
+    @field_validator("clerk_clock_skew_ms")
+    @classmethod
+    def validate_clerk_clock_skew(cls, value: int) -> int:
+        if not 0 <= value <= 120_000:
+            raise ValueError("CLERK_CLOCK_SKEW_MS must be between zero and 120000")
+        return value
+
     @field_validator(
         "crawler_max_depth",
         "crawler_max_pages",
         "crawler_max_concurrency_per_domain",
         "crawler_page_timeout_ms",
         "crawler_max_response_bytes",
+        "competitor_crawler_max_sources",
+        "competitor_crawler_max_depth",
+        "competitor_crawler_max_pages_per_source",
+        "competitor_crawler_max_concurrency_per_domain",
+        "competitor_crawler_page_timeout_ms",
+        "competitor_crawler_max_response_bytes",
+        "change_min_text_length",
     )
     @classmethod
     def validate_positive_crawler_limits(cls, value: int) -> int:
@@ -145,7 +176,7 @@ class Settings(BaseSettings):
             raise ValueError("Discovery query and result limits must be between 1 and 20")
         return value
 
-    @field_validator("crawler_max_retries")
+    @field_validator("crawler_max_retries", "competitor_crawler_max_retries")
     @classmethod
     def validate_retry_limit(cls, value: int) -> int:
         if not 0 <= value <= 5:
@@ -162,6 +193,20 @@ class Settings(BaseSettings):
             raise ValueError("CRAWLER_MIN_DELAY_SECONDS cannot be negative")
         if self.crawler_max_delay_seconds < self.crawler_min_delay_seconds:
             raise ValueError("Crawler maximum delay must be at least the minimum delay")
+        if self.competitor_crawler_max_sources > 50:
+            raise ValueError("Competitor source limit exceeds the safe maximum")
+        if self.competitor_crawler_max_depth > 1:
+            raise ValueError("Competitor crawl depth cannot exceed one")
+        if self.competitor_crawler_max_pages_per_source != 1:
+            raise ValueError("Phase 4 collects one page per competitor source")
+        if self.competitor_crawler_max_concurrency_per_domain != 1:
+            raise ValueError("Phase 4 supports one competitor request per domain")
+        if self.competitor_crawler_min_delay_seconds < 0:
+            raise ValueError("Competitor crawler minimum delay cannot be negative")
+        if self.competitor_crawler_max_delay_seconds < self.competitor_crawler_min_delay_seconds:
+            raise ValueError("Competitor crawler maximum delay must be at least the minimum")
+        if not 0 <= self.change_min_significance_score <= 1:
+            raise ValueError("CHANGE_MIN_SIGNIFICANCE_SCORE must be between zero and one")
         return self
 
     @model_validator(mode="after")

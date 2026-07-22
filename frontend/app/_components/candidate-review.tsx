@@ -17,15 +17,17 @@ export function CandidateReview() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadCandidates = useCallback(async (jobId: string) => {
+  const loadCandidates = useCallback(async (jobId: string, signal?: AbortSignal) => {
     const page = await api.request<CandidatePage>(
       `/api/v1/competitor-candidates?discovery_job_id=${encodeURIComponent(jobId)}&limit=100`,
+      { signal },
     );
     setCandidates(page.items);
   }, [api]);
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let polls = 0;
     async function poll() {
@@ -34,11 +36,12 @@ export function CandidateReview() {
           requestedJobId
             ? `/api/v1/competitor-discovery/jobs/${encodeURIComponent(requestedJobId)}`
             : "/api/v1/competitor-discovery/jobs/latest",
+          { signal: controller.signal },
         );
         if (cancelled) return;
         setJob(current);
         if (current.status === "succeeded" || current.status === "partially_succeeded") {
-          await loadCandidates(current.id);
+          await loadCandidates(current.id, controller.signal);
           return;
         }
         if (current.status === "failed") return;
@@ -46,12 +49,13 @@ export function CandidateReview() {
         if (polls < 160) timer = setTimeout(poll, 1500);
         else setError("Discovery is still running. You can safely return later.");
       } catch (pollError) {
-        if (!cancelled) setError(pollError instanceof ApiError ? pollError.message : "Discovery status could not be loaded.");
+        if (!cancelled && !(pollError instanceof ApiError && pollError.kind === "cancelled")) setError(pollError instanceof ApiError ? pollError.message : "Discovery status could not be loaded.");
       }
     }
     void poll();
     return () => {
       cancelled = true;
+      controller.abort();
       if (timer) clearTimeout(timer);
     };
   }, [api, loadCandidates, requestedJobId]);

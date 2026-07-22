@@ -9,7 +9,7 @@ export default function OnboardingPage() {
       </h1>
       <p className="mt-4 max-w-2xl leading-7 text-zinc-600 dark:text-zinc-400">
         We use this information and your public website to build an evidence-backed company
-        profile. If you do not have an active workspace, one is created from your company name.
+        profile for the active company workspace.
       </p>
       <OnboardingForm />
     </main>

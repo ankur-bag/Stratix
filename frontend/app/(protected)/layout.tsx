@@ -1,5 +1,6 @@
 import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
+import { CompanyWorkspaceBoundary } from "@/app/_components/company-workspace-boundary";
 
 export default async function ProtectedLayout({
   children,
@@ -10,5 +11,5 @@ export default async function ProtectedLayout({
     redirect("/sign-in");
   }
 
-  return children;
+  return <CompanyWorkspaceBoundary>{children}</CompanyWorkspaceBoundary>;
 }

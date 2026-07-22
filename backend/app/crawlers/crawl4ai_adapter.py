@@ -4,6 +4,7 @@ import random
 import re
 from collections import deque
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any
 
 from app.core.config import Settings
@@ -45,8 +46,12 @@ class Crawl4AIWebsiteCrawler:
         )
         run_config = crawl4ai.CrawlerRunConfig(
             cache_mode=crawl4ai.CacheMode.BYPASS,
-            check_robots_txt=self._settings.crawler_check_robots,
-            page_timeout=self._settings.crawler_page_timeout_ms,
+            check_robots_txt=(
+                request.check_robots
+                if request.check_robots is not None
+                else self._settings.crawler_check_robots
+            ),
+            page_timeout=request.page_timeout_ms or self._settings.crawler_page_timeout_ms,
             semaphore_count=1,
             max_retries=0,
             screenshot=False,
@@ -70,7 +75,7 @@ class Crawl4AIWebsiteCrawler:
                         )
                     )
                 page, page_error = await self._crawl_page(
-                    crawler, requested_url, registered_url, run_config
+                    crawler, requested_url, registered_url, run_config, request
                 )
                 if page_error is not None:
                     errors.append(page_error)
@@ -105,15 +110,23 @@ class Crawl4AIWebsiteCrawler:
         requested_url: str,
         registered_url: str,
         run_config: Any,
+        request: CrawlRequest,
     ) -> tuple[CrawlPageResult | None, CrawlError | None]:
         try:
             safe_url = await self._policy.validate_target(requested_url, registered_url)
         except CrawlPolicyViolation as exc:
             return None, self._policy_error(exc, requested_url)
-        attempts = self._settings.crawler_max_retries + 1
+        attempts = (
+            (request.max_retries or 0) + 1
+            if request.max_retries is not None
+            else (self._settings.crawler_max_retries + 1)
+        )
+        timeout_ms = request.page_timeout_ms or self._settings.crawler_page_timeout_ms
+        max_response_bytes = request.max_response_bytes or self._settings.crawler_max_response_bytes
         for attempt in range(attempts):
+            page_started = perf_counter()
             try:
-                async with asyncio.timeout(self._settings.crawler_page_timeout_ms / 1000):
+                async with asyncio.timeout(timeout_ms / 1000):
                     container = await crawler.arun(url=safe_url, config=run_config)
                     raw = container[0]
             except TimeoutError:
@@ -164,7 +177,7 @@ class Crawl4AIWebsiteCrawler:
                     message="The company website page could not be collected.",
                     url=safe_url,
                 )
-            if len(raw.html.encode("utf-8")) > self._settings.crawler_max_response_bytes:
+            if len(raw.html.encode("utf-8")) > max_response_bytes:
                 return None, CrawlError(
                     code=CrawlErrorCode.CRAWL_RESPONSE_TOO_LARGE,
                     message="The company website page exceeded the response-size limit.",
@@ -185,6 +198,7 @@ class Crawl4AIWebsiteCrawler:
                 )
             metadata = self._metadata(raw.metadata)
             links = self._links(raw.links)
+            content_type = str((raw.response_headers or {}).get("content-type", "")) or None
             return (
                 CrawlPageResult(
                     requested_url=safe_url,
@@ -197,6 +211,8 @@ class Crawl4AIWebsiteCrawler:
                     metadata=metadata,
                     fetched_at=datetime.now(UTC),
                     crawler_used="crawl4ai",
+                    content_type=content_type,
+                    crawl_duration_ms=round((perf_counter() - page_started) * 1000, 2),
                 ),
                 None,
             )

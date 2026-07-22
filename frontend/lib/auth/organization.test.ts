@@ -1,38 +1,51 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ensureActiveOrganization } from "./organization.ts";
+import {
+  activateOrganization,
+  CompanyWorkspaceError,
+  normalizeOptionalWebsite,
+  validateCompanyName,
+} from "./organization.ts";
 
-test("reuses an active Organization and refreshes the token", async () => {
-  let tokenRefreshed = false;
-  const token = await ensureActiveOrganization({
-    activeOrganizationId: "org_existing",
-    companyName: "Existing",
-    createOrganization: async () => { throw new Error("must not create"); },
-    setActive: async () => { throw new Error("must not activate"); },
-    getToken: async ({ skipCache }) => {
-      tokenRefreshed = skipCache;
-      return "fresh-token";
-    },
-  });
-  assert.equal(token, "fresh-token");
-  assert.equal(tokenRefreshed, true);
+test("normalizes and validates company creation fields", () => {
+  assert.equal(validateCompanyName("  Acme   Labs  "), "Acme Labs");
+  assert.equal(normalizeOptionalWebsite(""), null);
+  assert.equal(normalizeOptionalWebsite("https://acme.test"), "https://acme.test/");
+  assert.throws(
+    () => validateCompanyName("A"),
+    (error: unknown) =>
+      error instanceof CompanyWorkspaceError && error.code === "INVALID_COMPANY_NAME",
+  );
+  assert.throws(
+    () => normalizeOptionalWebsite("ftp://acme.test"),
+    (error: unknown) =>
+      error instanceof CompanyWorkspaceError && error.code === "INVALID_COMPANY_WEBSITE",
+  );
 });
 
-test("creates and activates an Organization before requesting the token", async () => {
+test("activates a selected organization and waits until Clerk reflects it", async () => {
   const events: string[] = [];
-  const token = await ensureActiveOrganization({
-    activeOrganizationId: null,
-    companyName: "  Acme Labs  ",
-    createOrganization: async ({ name }) => {
-      events.push(`create:${name}`);
-      return { id: "org_new" };
-    },
+  let activeOrganizationId: string | null = null;
+  await activateOrganization({
+    organizationId: "org_new",
     setActive: async ({ organization }) => { events.push(`activate:${organization}`); },
-    getToken: async () => {
-      events.push("token");
-      return "fresh-token";
-    },
+    getActiveOrganizationId: () => activeOrganizationId,
+    delay: async () => { activeOrganizationId = "org_new"; },
   });
-  assert.equal(token, "fresh-token");
-  assert.deepEqual(events, ["create:Acme Labs", "activate:org_new", "token"]);
+  assert.deepEqual(events, ["activate:org_new"]);
+});
+
+test("returns a stable timeout when activation never settles", async () => {
+  await assert.rejects(
+    () => activateOrganization({
+      organizationId: "org_new",
+      setActive: async () => undefined,
+      getActiveOrganizationId: () => null,
+      attempts: 2,
+      delay: async () => undefined,
+    }),
+    (error: unknown) =>
+      error instanceof CompanyWorkspaceError &&
+      error.code === "ORGANIZATION_ACTIVATION_TIMEOUT",
+  );
 });

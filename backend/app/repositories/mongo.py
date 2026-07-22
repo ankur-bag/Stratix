@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Mapping
+from datetime import datetime
 from typing import Any, cast
 
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, ReturnDocument
@@ -11,13 +12,14 @@ from app.domain.discovery import (
     CandidateStatus,
     Competitor,
     CompetitorCandidate,
-    CompetitorSource,
     DiscoveryJob,
     DiscoveryJobStatus,
     DiscoveryStage,
     RelationshipType,
 )
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
+from app.domain.monitoring import CompetitorSource
+from app.domain.monitoring import SourceStatus as CompetitorSourceStatus
 from app.domain.onboarding import (
     CompanyProfile,
     IdempotencyRecord,
@@ -31,6 +33,8 @@ from app.domain.onboarding import (
     model_from_document,
     utc_now,
 )
+from app.domain.scanning import CompetitorScanJob, CompetitorSnapshot, ScanStage, ScanStatus
+from app.domain.signals import CompetitorSignal, SignalStatus, SignalType
 from app.repositories.interfaces import (
     RepositoryConflictError,
     RepositoryUnavailableError,
@@ -57,7 +61,10 @@ def _document(
     | DiscoveryJob
     | CompetitorCandidate
     | Competitor
-    | CompetitorSource,
+    | CompetitorSource
+    | CompetitorScanJob
+    | CompetitorSnapshot
+    | CompetitorSignal,
 ) -> Document:
     if isinstance(model, CompanyProfile):
         return company_document(model)
@@ -770,6 +777,24 @@ class MongoCompetitorRepository:
         )
         return cast(Competitor, model_from_document(Competitor, document)) if document else None
 
+    async def get_by_id(self, organization_id: str, competitor_id: str) -> Competitor | None:
+        document = await _mongo(
+            self._collection.find_one({"organization_id": organization_id, "_id": competitor_id})
+        )
+        return cast(Competitor, model_from_document(Competitor, document)) if document else None
+
+    async def update(
+        self, organization_id: str, competitor_id: str, changes: Mapping[str, Any]
+    ) -> Competitor | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"organization_id": organization_id, "_id": competitor_id},
+                {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return cast(Competitor, model_from_document(Competitor, document)) if document else None
+
     async def list(self, organization_id: str, *, limit: int) -> list[Competitor]:
         documents = await _mongo(
             self._collection.find({"organization_id": organization_id})
@@ -793,17 +818,392 @@ class MongoCompetitorSourceRepository:
         return source
 
     async def list_for_competitor(
-        self, organization_id: str, competitor_id: str
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+        enabled_only: bool = False,
     ) -> list[CompetitorSource]:
+        query: Document = {"organization_id": organization_id, "competitor_id": competitor_id}
+        if cursor:
+            query["_id"] = {"$gt": cursor}
+        if enabled_only:
+            query["enabled"] = True
         documents = await _mongo(
-            self._collection.find(
-                {"organization_id": organization_id, "competitor_id": competitor_id}
-            ).to_list(length=100)
+            self._collection.find(query).sort("_id", ASCENDING).to_list(length=limit)
         )
         return [
             cast(CompetitorSource, model_from_document(CompetitorSource, item))
             for item in documents
         ]
+
+    async def get_by_id(
+        self, organization_id: str, competitor_id: str, source_id: str
+    ) -> CompetitorSource | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "competitor_id": competitor_id,
+                    "_id": source_id,
+                }
+            )
+        )
+        return (
+            cast(CompetitorSource, model_from_document(CompetitorSource, document))
+            if document
+            else None
+        )
+
+    async def update(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        source_id: str,
+        changes: Mapping[str, Any],
+    ) -> CompetitorSource | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {
+                    "organization_id": organization_id,
+                    "competitor_id": competitor_id,
+                    "_id": source_id,
+                },
+                {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return (
+            cast(CompetitorSource, model_from_document(CompetitorSource, document))
+            if document
+            else None
+        )
+
+    async def set_status(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        source_id: str,
+        source_status: CompetitorSourceStatus,
+        *,
+        error_code: str | None = None,
+    ) -> CompetitorSource | None:
+        return await self.update(
+            organization_id,
+            competitor_id,
+            source_id,
+            {"status": source_status, "last_error_code": error_code},
+        )
+
+
+class MongoCompetitorScanRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, scan: CompetitorScanJob) -> CompetitorScanJob:
+        try:
+            await self._collection.insert_one(_document(scan))
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return scan
+
+    async def get_by_id(self, organization_id: str, scan_id: str) -> CompetitorScanJob | None:
+        document = await _mongo(
+            self._collection.find_one({"organization_id": organization_id, "_id": scan_id})
+        )
+        return (
+            cast(CompetitorScanJob, model_from_document(CompetitorScanJob, document))
+            if document
+            else None
+        )
+
+    async def get_by_idempotency_key(
+        self, organization_id: str, idempotency_key: str
+    ) -> CompetitorScanJob | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {"organization_id": organization_id, "idempotency_key": idempotency_key}
+            )
+        )
+        return (
+            cast(CompetitorScanJob, model_from_document(CompetitorScanJob, document))
+            if document
+            else None
+        )
+
+    async def get_active_for_competitor(
+        self, organization_id: str, competitor_id: str
+    ) -> CompetitorScanJob | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "competitor_id": competitor_id,
+                    "status": {"$in": [ScanStatus.QUEUED, ScanStatus.RUNNING]},
+                },
+                sort=[("created_at", DESCENDING)],
+            )
+        )
+        return (
+            cast(CompetitorScanJob, model_from_document(CompetitorScanJob, document))
+            if document
+            else None
+        )
+
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> list[CompetitorScanJob]:
+        query: Document = {
+            "organization_id": organization_id,
+            "competitor_id": competitor_id,
+        }
+        if cursor:
+            cursor_document = await _mongo(
+                self._collection.find_one({"organization_id": organization_id, "_id": cursor})
+            )
+            if cursor_document:
+                query["$or"] = [
+                    {"created_at": {"$lt": cursor_document["created_at"]}},
+                    {
+                        "created_at": cursor_document["created_at"],
+                        "_id": {"$lt": cursor},
+                    },
+                ]
+        documents = await _mongo(
+            self._collection.find(query)
+            .sort([("created_at", DESCENDING), ("_id", DESCENDING)])
+            .to_list(length=limit)
+        )
+        return [
+            cast(CompetitorScanJob, model_from_document(CompetitorScanJob, item))
+            for item in documents
+        ]
+
+    async def update_progress(
+        self,
+        organization_id: str,
+        scan_id: str,
+        stage: ScanStage,
+        progress_percent: int,
+        message: str,
+        metrics: Mapping[str, int] | None = None,
+    ) -> CompetitorScanJob | None:
+        changes: Document = {
+            "stage": stage,
+            "progress_percent": progress_percent,
+            "message": message,
+            **dict(metrics or {}),
+        }
+        return await self._update(organization_id, scan_id, changes)
+
+    async def mark_running(self, organization_id: str, scan_id: str) -> CompetitorScanJob | None:
+        return await self._update(
+            organization_id,
+            scan_id,
+            {"status": ScanStatus.RUNNING, "started_at": utc_now()},
+        )
+
+    async def finalize(
+        self,
+        organization_id: str,
+        scan_id: str,
+        scan_status: ScanStatus,
+        *,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> CompetitorScanJob | None:
+        return await self._update(
+            organization_id,
+            scan_id,
+            {
+                "status": scan_status,
+                "stage": ScanStage.FAILED
+                if scan_status == ScanStatus.FAILED
+                else ScanStage.COMPLETED,
+                "progress_percent": 100,
+                "message": "The competitor scan could not be completed."
+                if scan_status == ScanStatus.FAILED
+                else "Competitor scan completed.",
+                "error_code": error_code,
+                "error_message": error_message,
+                "completed_at": utc_now(),
+            },
+        )
+
+    async def _update(
+        self, organization_id: str, scan_id: str, changes: Mapping[str, Any]
+    ) -> CompetitorScanJob | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"organization_id": organization_id, "_id": scan_id},
+                {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return (
+            cast(CompetitorScanJob, model_from_document(CompetitorScanJob, document))
+            if document
+            else None
+        )
+
+
+class MongoCompetitorSnapshotRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, snapshot: CompetitorSnapshot) -> CompetitorSnapshot:
+        try:
+            await self._collection.insert_one(_document(snapshot))
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return snapshot
+
+    async def get_by_id(self, organization_id: str, snapshot_id: str) -> CompetitorSnapshot | None:
+        document = await _mongo(
+            self._collection.find_one({"organization_id": organization_id, "_id": snapshot_id})
+        )
+        return (
+            cast(CompetitorSnapshot, model_from_document(CompetitorSnapshot, document))
+            if document
+            else None
+        )
+
+    async def get_latest_for_source(
+        self, organization_id: str, source_id: str
+    ) -> CompetitorSnapshot | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {"organization_id": organization_id, "source_id": source_id},
+                sort=[("fetched_at", DESCENDING), ("created_at", DESCENDING)],
+            )
+        )
+        return (
+            cast(CompetitorSnapshot, model_from_document(CompetitorSnapshot, document))
+            if document
+            else None
+        )
+
+    async def get_for_scan_source(
+        self, organization_id: str, scan_id: str, source_id: str
+    ) -> CompetitorSnapshot | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "scan_id": scan_id,
+                    "source_id": source_id,
+                }
+            )
+        )
+        return (
+            cast(CompetitorSnapshot, model_from_document(CompetitorSnapshot, document))
+            if document
+            else None
+        )
+
+
+class MongoCompetitorSignalRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, signal: CompetitorSignal) -> CompetitorSignal:
+        try:
+            await self._collection.insert_one(_document(signal))
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return signal
+
+    async def get_by_id(self, organization_id: str, signal_id: str) -> CompetitorSignal | None:
+        document = await _mongo(
+            self._collection.find_one({"organization_id": organization_id, "_id": signal_id})
+        )
+        return (
+            cast(CompetitorSignal, model_from_document(CompetitorSignal, document))
+            if document
+            else None
+        )
+
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        signal_type: SignalType | None,
+        signal_status: SignalStatus | None,
+        minimum_importance: float,
+        source_id: str | None,
+        observed_after: datetime | None,
+        observed_before: datetime | None,
+        scan_id: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[CompetitorSignal]:
+        query: Document = {
+            "organization_id": organization_id,
+            "competitor_id": competitor_id,
+            "importance_score": {"$gte": minimum_importance},
+        }
+        if signal_type is not None:
+            query["type"] = signal_type
+        if signal_status is not None:
+            query["status"] = signal_status
+        if source_id is not None:
+            query["source_id"] = source_id
+        if scan_id is not None:
+            query["scan_id"] = scan_id
+        if observed_after is not None or observed_before is not None:
+            query["observed_at"] = {
+                **({"$gte": observed_after} if observed_after is not None else {}),
+                **({"$lte": observed_before} if observed_before is not None else {}),
+            }
+        if cursor:
+            cursor_document = await _mongo(
+                self._collection.find_one({"organization_id": organization_id, "_id": cursor})
+            )
+            if cursor_document:
+                query["$or"] = [
+                    {"observed_at": {"$lt": cursor_document["observed_at"]}},
+                    {
+                        "observed_at": cursor_document["observed_at"],
+                        "_id": {"$lt": cursor},
+                    },
+                ]
+        documents = await _mongo(
+            self._collection.find(query)
+            .sort([("observed_at", DESCENDING), ("_id", DESCENDING)])
+            .to_list(length=limit)
+        )
+        return [
+            cast(CompetitorSignal, model_from_document(CompetitorSignal, item))
+            for item in documents
+        ]
+
+    async def update_status(
+        self, organization_id: str, signal_id: str, signal_status: SignalStatus
+    ) -> CompetitorSignal | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"organization_id": organization_id, "_id": signal_id},
+                {"$set": {"status": signal_status}},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return (
+            cast(CompetitorSignal, model_from_document(CompetitorSignal, document))
+            if document
+            else None
+        )
 
 
 class MongoPersistence:
@@ -823,6 +1223,9 @@ class MongoPersistence:
         self.competitor_candidates: MongoCompetitorCandidateRepository
         self.competitors: MongoCompetitorRepository
         self.competitor_sources: MongoCompetitorSourceRepository
+        self.competitor_scans: MongoCompetitorScanRepository
+        self.competitor_snapshots: MongoCompetitorSnapshotRepository
+        self.competitor_signals: MongoCompetitorSignalRepository
 
     async def start(self) -> None:
         self._client = AsyncMongoClient(
@@ -852,6 +1255,13 @@ class MongoPersistence:
         self.competitor_sources = MongoCompetitorSourceRepository(
             self._database["competitor_sources"]
         )
+        self.competitor_scans = MongoCompetitorScanRepository(
+            self._database["competitor_scan_jobs"]
+        )
+        self.competitor_snapshots = MongoCompetitorSnapshotRepository(
+            self._database["competitor_snapshots"]
+        )
+        self.competitor_signals = MongoCompetitorSignalRepository(self._database["signals"])
         if await self.ping():
             await self._create_indexes()
 
@@ -993,9 +1403,98 @@ class MongoPersistence:
                 [
                     ("organization_id", ASCENDING),
                     ("competitor_id", ASCENDING),
-                    ("url", ASCENDING),
+                    ("canonical_url", ASCENDING),
                 ],
                 unique=True,
+            )
+            await competitor_sources.create_index(
+                [("organization_id", ASCENDING), ("status", ASCENDING)]
+            )
+            competitor_scans = self._database["competitor_scan_jobs"]
+            await competitor_scans.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("created_at", DESCENDING),
+                ]
+            )
+            await competitor_scans.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("status", ASCENDING),
+                ]
+            )
+            await competitor_scans.create_index(
+                [("organization_id", ASCENDING), ("idempotency_key", ASCENDING)],
+                unique=True,
+            )
+            competitor_snapshots = self._database["competitor_snapshots"]
+            await competitor_snapshots.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("created_at", DESCENDING),
+                ]
+            )
+            await competitor_snapshots.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("source_id", ASCENDING),
+                    ("fetched_at", DESCENDING),
+                ]
+            )
+            await competitor_snapshots.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("source_id", ASCENDING),
+                    ("content_hash", ASCENDING),
+                ]
+            )
+            await competitor_snapshots.create_index(
+                [("organization_id", ASCENDING), ("scan_id", ASCENDING)]
+            )
+            await competitor_snapshots.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("scan_id", ASCENDING),
+                    ("source_id", ASCENDING),
+                ],
+                unique=True,
+            )
+            await competitor_snapshots.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("page_type", ASCENDING),
+                    ("fetched_at", DESCENDING),
+                ]
+            )
+            signals = self._database["signals"]
+            await signals.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("observed_at", DESCENDING),
+                ]
+            )
+            await signals.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("status", ASCENDING),
+                ]
+            )
+            await signals.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("type", ASCENDING),
+                ]
+            )
+            await signals.create_index([("organization_id", ASCENDING), ("scan_id", ASCENDING)])
+            await signals.create_index(
+                [("organization_id", ASCENDING), ("current_snapshot_id", ASCENDING)]
             )
         except PyMongoError as exc:
             raise RepositoryUnavailableError from exc

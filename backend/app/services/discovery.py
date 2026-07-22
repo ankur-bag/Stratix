@@ -1,5 +1,6 @@
 import re
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -19,7 +20,6 @@ from app.domain.discovery import (
     CandidateStatus,
     Competitor,
     CompetitorCandidate,
-    CompetitorSource,
     CompetitorStatus,
     DiscoveryEvidence,
     DiscoveryJob,
@@ -31,6 +31,7 @@ from app.domain.discovery import (
     ReviewDecision,
 )
 from app.domain.intelligence import CompanyIntelligenceProfile
+from app.domain.monitoring import CompetitorSource
 from app.domain.onboarding import (
     CompanyProfile,
     OnboardingStatus,
@@ -78,6 +79,12 @@ class CandidateClassifier(Protocol):
     async def classify(
         self, *, candidates: list[CompetitorCandidate]
     ) -> CandidateClassificationBatch: ...
+
+
+class CompetitorBaselineStarter(Protocol):
+    async def start_auto(
+        self, *, organization_id: str, competitor_id: str, requested_by_user_id: str
+    ) -> None: ...
 
 
 class DiscoveryClassificationError(Exception):
@@ -445,9 +452,15 @@ class CompetitorDiscoveryRunner:
 class CompetitorDiscoveryService:
     """Coordinate discovery creation, retrieval, and auditable review."""
 
-    def __init__(self, persistence: Persistence, executor: BackgroundExecutor) -> None:
+    def __init__(
+        self,
+        persistence: Persistence,
+        executor: BackgroundExecutor,
+        baseline_starter: CompetitorBaselineStarter | None = None,
+    ) -> None:
         self._persistence = persistence
         self._executor = executor
+        self._baseline_starter = baseline_starter
 
     async def start(
         self, *, context: AuthenticatedContext, idempotency_key: str
@@ -688,6 +701,7 @@ class CompetitorDiscoveryService:
             updated_at=now,
             approved_at=now,
             approved_by_user_id=context.user_id,
+            source_count=1,
         )
         source = CompetitorSource(
             id=new_id(),
@@ -711,10 +725,35 @@ class CompetitorDiscoveryService:
                 message="A competitor with this domain already exists.",
                 status_code=409,
             ) from exc
+        if self._baseline_starter is not None:
+            # Approval must survive independent background scheduling failures.
+            with suppress(Exception):
+                await self._baseline_starter.start_auto(
+                    organization_id=context.organization_id,
+                    competitor_id=competitor.id,
+                    requested_by_user_id=context.user_id,
+                )
+            refreshed = await self._persistence.competitors.get_by_id(
+                context.organization_id, competitor.id
+            )
+            if refreshed is not None:
+                competitor = refreshed
         return competitor
 
     async def list_competitors(self, context: AuthenticatedContext) -> list[Competitor]:
         return await self._persistence.competitors.list(context.organization_id, limit=100)
+
+    async def get_competitor(self, context: AuthenticatedContext, competitor_id: str) -> Competitor:
+        competitor = await self._persistence.competitors.get_by_id(
+            context.organization_id, competitor_id
+        )
+        if competitor is None:
+            raise AppError(
+                code="COMPETITOR_NOT_FOUND",
+                message="The competitor was not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return competitor
 
     @staticmethod
     def _response(job: DiscoveryJob) -> DiscoveryJobResponse:

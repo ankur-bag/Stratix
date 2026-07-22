@@ -20,9 +20,15 @@ from app.crawlers.crawl4ai_adapter import Crawl4AIWebsiteCrawler
 from app.crawlers.models import WebsiteCrawler
 from app.crawlers.policy import CrawlPolicy, SystemDNSResolver
 from app.graphs.company_initialization import CompanyInitializationGraph
+from app.graphs.competitor_scan import CompetitorScanGraph
 from app.middleware import RequestContextMiddleware
 from app.repositories.interfaces import Persistence
 from app.repositories.mongo import MongoPersistence
+from app.services.change_detection import DeterministicChangeDetector
+from app.services.competitor_sources import (
+    CompetitorSourceService,
+    DeterministicCompetitorSourceDiscoveryService,
+)
 from app.services.discovery import (
     CandidateClassifier,
     CompetitorDiscoveryRunner,
@@ -45,6 +51,13 @@ from app.services.initialization import (
 )
 from app.services.normalization import ContentNormalizer
 from app.services.onboarding import CompanyOnboardingService
+from app.services.scanning import (
+    CompetitorScanExecutor,
+    CompetitorScanService,
+    GraphCompetitorScanRunner,
+    InProcessCompetitorScanExecutor,
+)
+from app.services.signals import CompetitorSignalService, DeterministicSignalBuilder
 
 
 def create_app(
@@ -58,6 +71,7 @@ def create_app(
     discovery_background_executor: BackgroundExecutor | None = None,
     search_provider: CompetitorSearchProvider | None = None,
     candidate_classifier: CandidateClassifier | None = None,
+    competitor_scan_executor: CompetitorScanExecutor | None = None,
 ) -> FastAPI:
     """Create and configure a Stratix API application instance."""
     application_settings = settings or get_settings()
@@ -66,8 +80,9 @@ def create_app(
     application_persistence = persistence or cast(
         Persistence, MongoPersistence(application_settings)
     )
+    application_crawl_policy = CrawlPolicy(SystemDNSResolver())
     application_crawler = crawler or Crawl4AIWebsiteCrawler(
-        application_settings, CrawlPolicy(SystemDNSResolver())
+        application_settings, application_crawl_policy
     )
     application_extractor = intelligence_extractor or (
         UnavailableCompanyIntelligenceExtractor()
@@ -87,6 +102,7 @@ def create_app(
             jwt_key=application_settings.clerk_jwt_key,
             authorized_parties=application_settings.clerk_authorized_parties,
             require_organization=application_settings.clerk_require_organization,
+            clock_skew_ms=application_settings.clerk_clock_skew_ms,
         )
     else:
         application_authentication_verifier = UnavailableAuthenticationVerifier()
@@ -99,6 +115,26 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         await application_persistence.start()
+        source_service = CompetitorSourceService(application_persistence)
+        source_discovery = DeterministicCompetitorSourceDiscoveryService(
+            application_persistence,
+            application_crawler,
+            application_crawl_policy,
+            application_settings,
+        )
+        scan_graph = CompetitorScanGraph(
+            persistence=application_persistence,
+            crawler=application_crawler,
+            normalizer=ContentNormalizer(),
+            change_detector=DeterministicChangeDetector(application_settings),
+            signal_builder=DeterministicSignalBuilder(),
+            source_discovery=source_discovery,
+            source_service=source_service,
+            settings=application_settings,
+        )
+        scan_runner = GraphCompetitorScanRunner(application_persistence, scan_graph)
+        scan_executor = competitor_scan_executor or InProcessCompetitorScanExecutor(scan_runner)
+        scan_service = CompetitorScanService(application_persistence, scan_executor)
         graph = CompanyInitializationGraph(
             persistence=application_persistence,
             crawler=application_crawler,
@@ -115,7 +151,11 @@ def create_app(
         discovery_executor = discovery_background_executor or InProcessBackgroundExecutor(
             discovery_runner
         )
-        discovery_service = CompetitorDiscoveryService(application_persistence, discovery_executor)
+        discovery_service = CompetitorDiscoveryService(
+            application_persistence,
+            discovery_executor,
+            scan_service if application_settings.auto_start_competitor_baseline else None,
+        )
         runner = CompanyInitializationRunner(
             application_persistence,
             graph,
@@ -128,6 +168,13 @@ def create_app(
         application.state.discovery_runner = discovery_runner
         application.state.discovery_background_executor = discovery_executor
         application.state.discovery_service = discovery_service
+        application.state.competitor_source_service = source_service
+        application.state.competitor_scan_runner = scan_runner
+        application.state.competitor_scan_executor = scan_executor
+        application.state.competitor_scan_service = scan_service
+        application.state.competitor_signal_service = CompetitorSignalService(
+            application_persistence
+        )
         application.state.onboarding_service = CompanyOnboardingService(
             application_persistence, executor
         )
@@ -140,6 +187,7 @@ def create_app(
             await executor.close()
             if discovery_executor is not executor:
                 await discovery_executor.close()
+            await scan_executor.close()
             await application_persistence.close()
             logger.info("application_stopped")
 

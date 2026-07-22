@@ -21,6 +21,12 @@ def test_settings_reject_invalid_api_prefix() -> None:
         Settings(api_v1_prefix="api/v1", _env_file=None)
 
 
+def test_settings_validate_clerk_clock_skew() -> None:
+    assert Settings(_env_file=None).clerk_clock_skew_ms == 10_000
+    with pytest.raises(ValidationError, match="CLERK_CLOCK_SKEW_MS"):
+        Settings(clerk_clock_skew_ms=120_001, _env_file=None)
+
+
 def test_settings_reject_disabled_authentication_in_production() -> None:
     with pytest.raises(ValidationError, match="AUTH_DISABLED"):
         Settings(app_env="production", auth_disabled=True, _env_file=None)

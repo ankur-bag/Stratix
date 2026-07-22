@@ -49,6 +49,7 @@ export function InitializationProgress() {
     if (!jobId) return;
     const currentJobId = jobId;
     let cancelled = false;
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let polls = 0;
 
@@ -56,6 +57,7 @@ export function InitializationProgress() {
       try {
         const current = await api.request<InitializationJob>(
           `/api/v1/initialization-jobs/${encodeURIComponent(currentJobId)}`,
+          { signal: controller.signal },
         );
         if (cancelled) return;
         setJob(current);
@@ -71,7 +73,7 @@ export function InitializationProgress() {
         }
         timer = setTimeout(poll, 1500);
       } catch (pollError) {
-        if (!cancelled) {
+        if (!cancelled && !(pollError instanceof ApiError && pollError.kind === "cancelled")) {
           setError(pollError instanceof ApiError ? pollError.message : "Initialization status could not be loaded.");
         }
       }
@@ -79,6 +81,7 @@ export function InitializationProgress() {
     void poll();
     return () => {
       cancelled = true;
+      controller.abort();
       if (timer) clearTimeout(timer);
     };
   }, [api, continueToDiscovery, jobId]);

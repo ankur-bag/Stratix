@@ -1,5 +1,4 @@
-import { Show, SignInButton, SignUpButton } from "@clerk/nextjs";
-import Link from "next/link";
+import { HomeAuthActions } from "@/app/_components/auth-actions";
 
 export default function Home() {
   return (
@@ -14,11 +13,7 @@ export default function Home() {
             Stratix turns public competitor evidence into a traceable intelligence workspace for startup and product teams.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
-            <Show when="signed-out">
-              <SignUpButton mode="modal"><button className="rounded-full bg-foreground px-6 py-3 font-medium text-background">Create workspace</button></SignUpButton>
-              <SignInButton mode="modal"><button className="rounded-full border border-black/15 px-6 py-3 font-medium dark:border-white/15">Sign in</button></SignInButton>
-            </Show>
-            <Show when="signed-in"><Link className="rounded-full bg-foreground px-6 py-3 font-medium text-background" href="/route-after-auth">Open workspace</Link></Show>
+            <HomeAuthActions />
           </div>
         </section>
         <section className="rounded-3xl border border-black/10 bg-white p-7 shadow-sm dark:border-white/10 dark:bg-black">

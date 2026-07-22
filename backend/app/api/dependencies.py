@@ -4,8 +4,11 @@ from fastapi import Depends, Request, status
 
 from app.api.errors import AppError
 from app.core.auth import AuthenticatedContext, AuthenticationFailure, AuthenticationVerifier
+from app.services.competitor_sources import CompetitorSourceService
 from app.services.discovery import CompetitorDiscoveryService
 from app.services.onboarding import CompanyOnboardingService
+from app.services.scanning import CompetitorScanService
+from app.services.signals import CompetitorSignalService
 
 
 async def get_authenticated_context(request: Request) -> AuthenticatedContext:
@@ -64,6 +67,23 @@ def get_discovery_service(request: Request) -> CompetitorDiscoveryService:
     return cast(CompetitorDiscoveryService, request.app.state.discovery_service)
 
 
+def get_competitor_source_service(request: Request) -> CompetitorSourceService:
+    return cast(CompetitorSourceService, request.app.state.competitor_source_service)
+
+
+def get_competitor_scan_service(request: Request) -> CompetitorScanService:
+    return cast(CompetitorScanService, request.app.state.competitor_scan_service)
+
+
+def get_signal_service(request: Request) -> CompetitorSignalService:
+    return cast(CompetitorSignalService, request.app.state.competitor_signal_service)
+
+
 Authenticated = Annotated[AuthenticatedContext, Depends(require_active_organization)]
 OnboardingService = Annotated[CompanyOnboardingService, Depends(get_onboarding_service)]
 DiscoveryService = Annotated[CompetitorDiscoveryService, Depends(get_discovery_service)]
+CompetitorSourcesService = Annotated[
+    CompetitorSourceService, Depends(get_competitor_source_service)
+]
+CompetitorScansService = Annotated[CompetitorScanService, Depends(get_competitor_scan_service)]
+SignalsService = Annotated[CompetitorSignalService, Depends(get_signal_service)]

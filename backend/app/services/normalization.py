@@ -16,6 +16,14 @@ BOILERPLATE_EXACT = {
     "all rights reserved",
     "back to top",
 }
+BOILERPLATE_HEADINGS = {
+    "cookie preferences",
+    "footer",
+    "legal",
+    "menu",
+    "navigation",
+    "privacy preferences",
+}
 
 
 class ContentNormalizer:
@@ -27,6 +35,7 @@ class ContentNormalizer:
         heading: str | None = None
         content: list[str] = []
         previous: str | None = None
+        skip_section = False
         for raw_line in source.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
             line = self._normalize_line(raw_line)
             if not line or self._is_boilerplate(line) or line == previous:
@@ -34,14 +43,19 @@ class ContentNormalizer:
             previous = line
             match = re.match(r"^#{1,6}\s+(.+)$", line)
             if match:
-                self._append_section(sections, heading, content)
+                if not skip_section:
+                    self._append_section(sections, heading, content)
                 heading = self._plain_text(match.group(1))
                 content = []
+                skip_section = heading.casefold() in BOILERPLATE_HEADINGS
             else:
+                if skip_section:
+                    continue
                 plain = self._plain_text(line)
                 if plain:
                     content.append(plain)
-        self._append_section(sections, heading, content)
+        if not skip_section:
+            self._append_section(sections, heading, content)
         if not sections:
             return NormalizedDocument(
                 markdown="", text="", content_hash=self._hash(""), sections=[]

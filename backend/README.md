@@ -19,6 +19,26 @@ Phase 3 preserves the Phase 0–2 FastAPI, PyMongo, onboarding, Crawl4AI, normal
 
 Continuous competitor collection, rescanning, change detection, signals, and Deep Agents are not part of Phase 3.
 
+## Phase 4 monitoring
+
+Phase 4 adds the objective competitor-monitoring loop while preserving the Phase 0–3 behavior:
+
+```text
+approved competitor
+→ initial website source
+→ bounded source discovery
+→ persisted baseline scan
+→ later manual rescan
+→ deterministic normalization and section comparison
+→ evidence-linked objective signals
+```
+
+The first successful scan establishes baseline snapshots and never creates a change signal. An identical later scan records job progress but does not duplicate the full snapshot or create a signal. Distinct normalized content is versioned and linked to its previous snapshot; only changes above the configured deterministic threshold create signals. Signal types use page type, section additions/removals, and structured numeric changes. They do not contain strategic interpretation, intent, opportunity analysis, or recommendations.
+
+Source discovery starts from the approved canonical domain, retains same-domain public HTML pages, removes tracking parameters and fragments, rejects account/private/file routes, and stays within `COMPETITOR_CRAWLER_MAX_SOURCES`. Every submitted, discovered, and redirected URL passes the existing SSRF and DNS policy. Robots denial and explicit access denial are not bypassed; blocked sources remain visible with a user-safe status.
+
+Competitor scans use LangGraph for serializable state, progress transitions, partial-source handling, snapshot persistence, deterministic comparison, signal construction, and competitor-state updates. Jobs run through a replaceable in-process executor. It is intentionally non-durable: a process restart can interrupt queued or running work, and Phase 4 does not automatically recover it.
+
 ## Stack
 
 - Python 3.12 and uv
@@ -58,14 +78,21 @@ APP_ENV=development
 AUTH_DISABLED=false
 CLERK_SECRET_KEY=
 CLERK_JWT_KEY=
-CLERK_AUTHORIZED_PARTIES=["http://localhost:3000"]
+CLERK_AUTHORIZED_PARTIES=["http://localhost:3000","http://localhost:3002"]
+CLERK_CLOCK_SKEW_MS=10000
 CLERK_REQUIRE_ORGANIZATION=true
-FRONTEND_ALLOWED_ORIGINS=["http://localhost:3000"]
+FRONTEND_ALLOWED_ORIGINS=["http://localhost:3000","http://localhost:3002"]
 ```
 
 `CLERK_JWT_KEY` is Clerk's PEM public key. Providing it enables networkless JWT signature verification; `CLERK_SECRET_KEY` remains available to the SDK for configurations that require Clerk's Backend API. Authorized parties must contain the exact frontend origins that may issue tokens for this API.
 
 All `/api/v1` routes require a verified user and active Organization. Health endpoints remain public and expose no provider details. Viewing and reviewing candidates requires Organization membership, not an administrator role. A reusable admin dependency exists for future destructive administrative operations.
+
+## Multi-company tenancy
+
+One Clerk user may belong to multiple Organizations. One Clerk Organization maps to exactly one Stratix company profile, and the verified `org_id` claim is the only tenant selector. The API never accepts a company or Organization ID from the browser to choose tenancy. The company-profile index is unique by `organization_id`; competitors, sources, jobs, snapshots, idempotency records, scans, and signals are queried and indexed with that same Organization boundary. Identifiers from another Organization return not found.
+
+The frontend must activate the selected Clerk Organization and mint a fresh token for that Organization before calling this API. Switching companies requires no backend migration and must not use a cross-company aggregation endpoint. Keep `CLERK_REQUIRE_ORGANIZATION=true` and explicitly configure every allowed frontend origin in both `CLERK_AUTHORIZED_PARTIES` and `FRONTEND_ALLOWED_ORIGINS`.
 
 Development authentication is available only with both `APP_ENV=development` and `AUTH_DISABLED=true`; it uses `DEV_USER_ID` and `DEV_ORGANIZATION_ID`. Production rejects disabled authentication. Production readiness returns `AUTH_CONFIGURATION_INVALID` when neither a Clerk JWT key nor secret key is configured, or authorized parties are empty. API documentation is controlled by `DOCS_ENABLED`.
 
@@ -132,6 +159,22 @@ Authenticated discovery and review:
 - `POST /api/v1/competitor-candidates/review`
 - `GET /api/v1/competitors`
 
+Authenticated competitor monitoring:
+
+- `GET /api/v1/competitors/{competitor_id}`
+- `GET/POST /api/v1/competitors/{competitor_id}/sources`
+- `PATCH/DELETE /api/v1/competitors/{competitor_id}/sources/{source_id}`
+- `POST /api/v1/competitors/{competitor_id}/sources/discover` with `Idempotency-Key`
+- `POST /api/v1/competitors/{competitor_id}/scans` with `Idempotency-Key`
+- `GET /api/v1/competitor-scans/{scan_id}`
+- `GET /api/v1/competitors/{competitor_id}/scans`
+- `GET /api/v1/competitors/{competitor_id}/signals`
+- `GET/PATCH /api/v1/signals/{signal_id}`
+
+Signal listing supports `type`, `status`, `minimum_importance`, `source_id`, observation-date, `scan_id`, cursor, and bounded-limit filters. Signal PATCH accepts only `reviewed` or `dismissed`; evidence and facts are immutable through the API.
+
+Configure Phase 4 with the `AUTO_START_COMPETITOR_BASELINE`, `COMPETITOR_CRAWLER_*`, and `CHANGE_*` values documented in `.env.example`. Defaults collect one page per source, one request at a time per domain, and at most 12 sources. There is no cron scheduler, durable queue, anti-bot bypass, authenticated crawling, or continuous monitoring in this phase.
+
 Candidate listing supports `status`, `relationship_type`, `minimum_score`, `discovery_job_id`, `cursor`, and bounded `limit` filters. Cross-Organization resources appear not found.
 
 ## Run and validate
@@ -150,4 +193,6 @@ uv run pytest
 git diff --check
 ```
 
-Tests use in-memory repositories and fake Clerk, crawler, search-provider, executor, and model boundaries. They require no Clerk network access, Tavily, MongoDB, live websites, DNS, browser downloads, or model credentials.
+Tests use in-memory repositories and fake Clerk, crawler, search-provider, executor, and model boundaries. Multi-company tests exercise two Organizations owned by one user, Organization-scoped idempotency, profiles, jobs, competitors, sources, scans, and signals, including cross-Organization not-found behavior. They require no Clerk network access, Tavily, MongoDB, live websites, DNS, browser downloads, or model credentials.
+
+For a manual local smoke test, approve a candidate, open `/competitors/{competitor_id}`, confirm the initial website source, create the baseline, and wait for the terminal status. Run the same fake/static page again to verify the no-change outcome, then change a pricing or feature section and rescan to verify before/after evidence. Live crawling and production data changes must be authorized separately.

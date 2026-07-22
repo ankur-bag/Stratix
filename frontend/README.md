@@ -32,9 +32,11 @@ NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
 
 ## Clerk Dashboard configuration
 
-Enable Organizations for the Clerk application and allow users to create Organizations. Configure the application URLs for local development, including `http://localhost:3000`, `/sign-in`, `/sign-up`, and the post-auth route `/route-after-auth`. The FastAPI backend must authorize the same origin.
+Enable Organizations for the Clerk application and allow users to create Organizations. Configure the application URLs for local development, including `http://localhost:3000` and `http://localhost:3002`, `/sign-in`, `/sign-up`, and the post-auth route `/route-after-auth`. The FastAPI backend must authorize the same origin.
 
-Users without an active Organization do not complete a separate workspace form. Company onboarding creates an Organization from the submitted company name, activates it, refreshes the default Clerk session token, and only then calls FastAPI. Existing active Organizations are reused.
+Keep Clerk in single-session mode. Enable Organizations and user-created Organizations, and do not enable personal workspaces for Stratix navigation. The Organization switcher uses `/companies/new` for creation and `/route-after-auth` after selection. Add the exact local origins used by the frontend (normally `http://localhost:3002`, optionally port 3000 as well) to Clerk's allowed origins/redirect configuration and to the backend authorized parties.
+
+Each Clerk Organization is exactly one Stratix company. `/companies/new` creates and activates an Organization before onboarding; onboarding never creates an Organization itself. `/companies` lists the signed-in user's memberships without aggregating backend tenant data.
 
 ## Routes
 
@@ -48,6 +50,7 @@ Public routes:
 Server-protected routes:
 
 - `/onboarding` and `/onboarding/**`
+- `/companies` and `/companies/new`
 - `/dashboard` and `/dashboard/**`
 - `/competitors` and `/competitors/**`
 - `/settings` and `/settings/**`
@@ -56,7 +59,7 @@ Next.js 16 uses `proxy.ts` with `clerkMiddleware()` and the Clerk-recommended ma
 
 ## Authenticated API behavior
 
-`lib/api/client.ts` is the single FastAPI client. It requests the current Clerk token for each protected call, sends `Authorization`, JSON content type, and optional request ID headers, and parses the backend's stable error envelope. Tokens are never written to local storage, session storage, application databases, or logs.
+`lib/api/client.ts` is the single FastAPI client. Every protected call requires an active Organization, requests a fresh Clerk token explicitly for that Organization ID, sends `Authorization` and optional request ID headers, and parses the backend's stable error envelope. A response is rejected if the active Organization changes while it is in flight. Components abort requests and clear polling through their unmount cleanup. Tokens are never written to browser storage, application databases, or logs.
 
 The UI flow is:
 
@@ -68,10 +71,22 @@ sign in/up
 → resolve automatic/manual discovery
 → poll discovery
 → review evidence and approve/reject candidates
-→ show approved competitors with monitoring pending
+→ open an approved competitor workspace
+→ discover or manage bounded public sources
+→ establish the first-scan baseline
+→ run a later manual rescan
+→ review objective before/after signals
 ```
 
 Polling is bounded and cleaned up on unmount. The UI labels relationship and confidence as assessments and does not present model output as verified fact.
+
+## Phase 4 competitor intelligence
+
+`/competitors/[competitorId]` displays the approved competitor, monitoring and baseline state, enabled public sources, recent scan progress, and recent evidence-linked signals. Users can add or disable a same-domain source, rediscover sources, create a baseline, run a later scan, and review or dismiss signal records. Active scans disable conflicting controls and poll at a bounded interval with cleanup on unmount.
+
+The initial scan establishes evidence and intentionally shows no change signal. A successful rescan renders either “No meaningful changes detected” or “Changes detected”; partial and failed scans remain distinct. Signal cards use “Observed change,” “Evidence,” “Before,” “After,” and “Detected on” language because Phase 4 signals are objective observations, not strategic interpretations.
+
+The authenticated client in `lib/api/client.ts` owns every monitoring request, asks Clerk for a token for each call, encodes resource IDs, generates idempotency keys for scan/discovery writes, and parses the backend error envelope. Tokens are never stored in browser storage.
 
 ## Validation
 
@@ -82,4 +97,6 @@ npm run test
 npm run build
 ```
 
-The lightweight offline tests use Node's built-in test runner with TypeScript transformation; they cover bearer-token headers, missing-token handling, stable backend errors, active-Organization reuse, and Organization creation/activation order. Browser-level Clerk redirects and live sign-in are not automated in this repository.
+The lightweight offline tests use Node's built-in test runner with TypeScript transformation; they cover Organization-scoped bearer tokens, missing Organization/token handling, stale-response rejection, cancellation, company-field validation, activation settling, and centralized workspace routing. Browser-level Clerk redirects and live sign-in are not automated in this repository.
+
+Manual browser smoke tests remain required for creating two companies, switching repeatedly while requests poll, verifying each company lands on its own onboarding/dashboard state, reloading after a switch, and confirming no previous-company data flashes. Also verify baseline polling, source-domain and robots warnings, evidence links, and narrow screens. Do not run a live competitor crawl without authorization.

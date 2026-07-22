@@ -6,12 +6,12 @@ from app.domain.discovery import (
     CandidateStatus,
     Competitor,
     CompetitorCandidate,
-    CompetitorSource,
     DiscoveryJob,
     DiscoveryStage,
     RelationshipType,
 )
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
+from app.domain.monitoring import CompetitorSource, SourceStatus
 from app.domain.onboarding import (
     CompanyProfile,
     IdempotencyRecord,
@@ -20,6 +20,8 @@ from app.domain.onboarding import (
     OnboardingStatus,
     Source,
 )
+from app.domain.scanning import CompetitorScanJob, CompetitorSnapshot, ScanStage, ScanStatus
+from app.domain.signals import CompetitorSignal, SignalStatus, SignalType
 
 
 class RepositoryConflictError(Exception):
@@ -202,14 +204,119 @@ class CompetitorRepository(Protocol):
     async def get_by_domain(
         self, organization_id: str, canonical_domain: str
     ) -> Competitor | None: ...
+    async def get_by_id(self, organization_id: str, competitor_id: str) -> Competitor | None: ...
+    async def update(
+        self, organization_id: str, competitor_id: str, changes: Mapping[str, Any]
+    ) -> Competitor | None: ...
     async def list(self, organization_id: str, *, limit: int) -> list[Competitor]: ...
 
 
 class CompetitorSourceRepository(Protocol):
     async def create(self, source: CompetitorSource) -> CompetitorSource: ...
+    async def get_by_id(
+        self, organization_id: str, competitor_id: str, source_id: str
+    ) -> CompetitorSource | None: ...
     async def list_for_competitor(
-        self, organization_id: str, competitor_id: str
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+        enabled_only: bool = False,
     ) -> list[CompetitorSource]: ...
+    async def update(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        source_id: str,
+        changes: Mapping[str, Any],
+    ) -> CompetitorSource | None: ...
+    async def set_status(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        source_id: str,
+        source_status: SourceStatus,
+        *,
+        error_code: str | None = None,
+    ) -> CompetitorSource | None: ...
+
+
+class CompetitorScanRepository(Protocol):
+    async def create(self, scan: CompetitorScanJob) -> CompetitorScanJob: ...
+    async def get_by_id(self, organization_id: str, scan_id: str) -> CompetitorScanJob | None: ...
+    async def get_by_idempotency_key(
+        self, organization_id: str, idempotency_key: str
+    ) -> CompetitorScanJob | None: ...
+    async def get_active_for_competitor(
+        self, organization_id: str, competitor_id: str
+    ) -> CompetitorScanJob | None: ...
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> list[CompetitorScanJob]: ...
+    async def update_progress(
+        self,
+        organization_id: str,
+        scan_id: str,
+        stage: ScanStage,
+        progress_percent: int,
+        message: str,
+        metrics: Mapping[str, int] | None = None,
+    ) -> CompetitorScanJob | None: ...
+    async def mark_running(
+        self, organization_id: str, scan_id: str
+    ) -> CompetitorScanJob | None: ...
+    async def finalize(
+        self,
+        organization_id: str,
+        scan_id: str,
+        scan_status: ScanStatus,
+        *,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> CompetitorScanJob | None: ...
+
+
+class CompetitorSnapshotRepository(Protocol):
+    async def create(self, snapshot: CompetitorSnapshot) -> CompetitorSnapshot: ...
+    async def get_by_id(
+        self, organization_id: str, snapshot_id: str
+    ) -> CompetitorSnapshot | None: ...
+    async def get_latest_for_source(
+        self, organization_id: str, source_id: str
+    ) -> CompetitorSnapshot | None: ...
+    async def get_for_scan_source(
+        self, organization_id: str, scan_id: str, source_id: str
+    ) -> CompetitorSnapshot | None: ...
+
+
+class CompetitorSignalRepository(Protocol):
+    async def create(self, signal: CompetitorSignal) -> CompetitorSignal: ...
+    async def get_by_id(self, organization_id: str, signal_id: str) -> CompetitorSignal | None: ...
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        signal_type: SignalType | None,
+        signal_status: SignalStatus | None,
+        minimum_importance: float,
+        source_id: str | None,
+        observed_after: datetime | None,
+        observed_before: datetime | None,
+        scan_id: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[CompetitorSignal]: ...
+    async def update_status(
+        self, organization_id: str, signal_id: str, signal_status: SignalStatus
+    ) -> CompetitorSignal | None: ...
 
 
 class Persistence(Protocol):
@@ -223,6 +330,9 @@ class Persistence(Protocol):
     competitor_candidates: CompetitorCandidateRepository
     competitors: CompetitorRepository
     competitor_sources: CompetitorSourceRepository
+    competitor_scans: CompetitorScanRepository
+    competitor_snapshots: CompetitorSnapshotRepository
+    competitor_signals: CompetitorSignalRepository
 
     async def start(self) -> None: ...
     async def ping(self) -> bool: ...
