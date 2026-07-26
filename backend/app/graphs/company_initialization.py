@@ -3,7 +3,9 @@ from typing import Literal, TypedDict, cast
 from langgraph.graph import END, START, StateGraph
 
 from app.core.config import Settings
+from app.core.logging import get_logger
 from app.crawlers.models import CrawlRequest, CrawlResult, WebsiteCrawler
+from app.domain.documents import DocumentStatus
 from app.domain.intelligence import (
     CompanyIntelligenceProfile,
     ExtractionStatus,
@@ -21,6 +23,8 @@ from app.domain.onboarding import (
 from app.repositories.interfaces import Persistence, RepositoryUnavailableError
 from app.services.extraction import CompanyIntelligenceExtractor
 from app.services.normalization import ContentNormalizer
+
+logger = get_logger(__name__)
 
 
 class InitializationError(TypedDict):
@@ -198,7 +202,14 @@ class CompanyInitializationGraph:
                     max_pages=self._settings.crawler_max_pages,
                 )
             )
-        except Exception:
+        except Exception as exc:
+            logger.error(
+                "company_website_crawl_failed",
+                organization_id=state["organization_id"],
+                company_profile_id=state["company_profile_id"],
+                initialization_job_id=state["initialization_job_id"],
+                exception_type=type(exc).__name__,
+            )
             return self._with_error(
                 state, "CRAWL_FAILED", "The company website could not be collected."
             )
@@ -405,6 +416,20 @@ class CompanyInitializationGraph:
                 message="Company intelligence initialization could not be completed.",
             )
         )
+        documents = await self._persistence.company_documents.list_for_organization(
+            state["organization_id"]
+        )
+        document_evidence_pending = any(
+            item.company_profile_id == state["company_profile_id"]
+            and item.status in {DocumentStatus.PROCESSING, DocumentStatus.READY}
+            for item in documents
+        )
+        if document_evidence_pending:
+            if state["source_id"] is not None and error["code"].startswith("CRAWL_"):
+                await self._persistence.sources.mark_failed(
+                    state["organization_id"], state["source_id"]
+                )
+            return {**state, "status": "failed"}
         await self._persistence.initialization_jobs.mark_failed(
             state["organization_id"],
             state["initialization_job_id"],

@@ -17,5 +17,6 @@ wheels/
 .ruff_cache/
 .coverage
 htmlcov/
+.data/
 
 .env

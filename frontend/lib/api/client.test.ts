@@ -132,6 +132,38 @@ test("scan writes include an idempotency key", async () => {
   }
 });
 
+test("company reinitialization uses an organization-scoped idempotent write", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    capturedUrl = String(input);
+    captured = init;
+    return Response.json(
+      {
+        initialization_job_id: "job-retry",
+        status: "queued",
+        stage: "queued",
+        progress_percent: 0,
+      },
+      { status: 202 },
+    );
+  };
+  try {
+    const api = client(async () => "session-token");
+    const response = await api.reinitializeCompany("reinitialize:stable-key");
+    assert.equal(response.initialization_job_id, "job-retry");
+    assert.equal(capturedUrl, "http://api.test/api/v1/company/reinitialize");
+    assert.equal(captured?.method, "POST");
+    assert.equal(
+      new Headers(captured?.headers).get("Idempotency-Key"),
+      "reinitialize:stable-key",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("fails before fetching when no active organization exists", async () => {
   const api = new ApiClient(async () => "session-token", "http://api.test", null);
   await assert.rejects(
@@ -183,6 +215,142 @@ test("reports aborted requests separately from network failures", async () => {
       () => api.request("/protected"),
       (error: unknown) => error instanceof ApiError && error.kind === "cancelled",
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("document upload request is organization-authenticated and contains no provider fields", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    capturedUrl = String(input);
+    captured = init;
+    return Response.json({
+      document: { id: "document-1" },
+      upload: { method: "PUT", url: "/api/v1/company-documents/document-1/content", headers: {} },
+    }, { status: 201 });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.createDocumentUpload(new File(["%PDF-test"], "brief.pdf", { type: "application/pdf" }));
+    assert.equal(capturedUrl, "http://api.test/api/v1/company-documents/upload-requests");
+    assert.equal(new Headers(captured?.headers).get("Authorization"), "Bearer organization-token");
+    const body = JSON.parse(String(captured?.body)) as Record<string, unknown>;
+    assert.deepEqual(body, {
+      filename: "brief.pdf",
+      content_type: "application/pdf",
+      size_bytes: 9,
+    });
+    assert.equal("organization_id" in body, false);
+    assert.equal("namespace" in body, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("presigned document upload does not send Clerk authorization cross-origin", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    capturedUrl = String(input);
+    captured = init;
+    return new Response(null, { status: 200 });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.uploadDocumentContent(
+      {
+        method: "PUT",
+        url: "https://private-storage.example/upload",
+        headers: { "x-upload-scope": "opaque" },
+      },
+      new File(["%PDF-test"], "brief.pdf", { type: "application/pdf" }),
+    );
+    assert.equal(capturedUrl, "https://private-storage.example/upload");
+    assert.equal(new Headers(captured?.headers).get("Authorization"), null);
+    assert.equal(new Headers(captured?.headers).get("x-upload-scope"), "opaque");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("document completion uses encoded id and active organization token", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    capturedUrl = String(input);
+    captured = init;
+    return Response.json({ id: "document/1", status: "uploaded" });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.completeDocumentUpload("document/1", "a".repeat(64), 1024);
+    assert.equal(capturedUrl, "http://api.test/api/v1/company-documents/document%2F1/complete");
+    assert.equal(new Headers(captured?.headers).get("Authorization"), "Bearer organization-token");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("document retry and delete actions remain organization scoped", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined; token: string | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    requests.push({
+      url: String(input),
+      method: init?.method,
+      token: new Headers(init?.headers).get("Authorization"),
+    });
+    return init?.method === "DELETE"
+      ? new Response(null, { status: 204 })
+      : Response.json({ id: "job-1", status: "queued" }, { status: 202 });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.reprocessCompanyDocument("document/1");
+    await api.deleteCompanyDocument("document/1");
+    assert.deepEqual(requests, [
+      {
+        url: "http://api.test/api/v1/company-documents/document%2F1/reprocess",
+        method: "POST",
+        token: "Bearer organization-token",
+      },
+      {
+        url: "http://api.test/api/v1/company-documents/document%2F1",
+        method: "DELETE",
+        token: "Bearer organization-token",
+      },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("cancelled cross-origin upload reports cancellation without leaking a token", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedAuthorization: string | null = "not-called";
+  globalThis.fetch = async (_input, init) => {
+    capturedAuthorization = new Headers(init?.headers).get("Authorization");
+    throw new DOMException("Aborted", "AbortError");
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await assert.rejects(
+      () =>
+        api.uploadDocumentContent(
+          { method: "PUT", url: "https://private-storage.example/upload", headers: {} },
+          new File(["%PDF-test"], "brief.pdf", { type: "application/pdf" }),
+        ),
+      (error: unknown) =>
+        error instanceof ApiError &&
+        error.kind === "cancelled" &&
+        error.code === "REQUEST_CANCELLED",
+    );
+    assert.equal(capturedAuthorization, null);
   } finally {
     globalThis.fetch = originalFetch;
   }

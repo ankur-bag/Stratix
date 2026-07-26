@@ -17,6 +17,14 @@ from app.domain.discovery import (
     DiscoveryStage,
     RelationshipType,
 )
+from app.domain.documents import (
+    CompanyDocument,
+    CompanyKnowledgeChunk,
+    DocumentIngestionJob,
+    DocumentJobStatus,
+    DocumentStage,
+    DocumentStatus,
+)
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
 from app.domain.monitoring import CompetitorSource
 from app.domain.monitoring import SourceStatus as CompetitorSourceStatus
@@ -58,6 +66,9 @@ def _document(
     | IdempotencyRecord
     | Snapshot
     | CompanyIntelligenceProfile
+    | CompanyDocument
+    | DocumentIngestionJob
+    | CompanyKnowledgeChunk
     | DiscoveryJob
     | CompetitorCandidate
     | Competitor
@@ -474,6 +485,233 @@ class MongoCompanyIntelligenceRepository:
             )
             if document
             else None
+        )
+
+
+class MongoCompanyDocumentRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, document: CompanyDocument) -> CompanyDocument:
+        try:
+            await self._collection.insert_one(_document(document))
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return document
+
+    async def get_by_id(
+        self, organization_id: str, document_id: str, *, include_deleted: bool = False
+    ) -> CompanyDocument | None:
+        query: dict[str, Any] = {
+            "_id": document_id,
+            "organization_id": organization_id,
+        }
+        if not include_deleted:
+            query["status"] = {"$ne": DocumentStatus.DELETED}
+        document = await _mongo(self._collection.find_one(query))
+        return (
+            cast(CompanyDocument, model_from_document(CompanyDocument, document))
+            if document
+            else None
+        )
+
+    async def list_for_organization(
+        self, organization_id: str, *, include_deleted: bool = False
+    ) -> list[CompanyDocument]:
+        query: dict[str, Any] = {"organization_id": organization_id}
+        if not include_deleted:
+            query["status"] = {"$ne": DocumentStatus.DELETED}
+        cursor = self._collection.find(query).sort("created_at", DESCENDING)
+        return [
+            cast(CompanyDocument, model_from_document(CompanyDocument, item))
+            async for item in cursor
+        ]
+
+    async def update(
+        self, organization_id: str, document_id: str, changes: Mapping[str, Any]
+    ) -> CompanyDocument | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"_id": document_id, "organization_id": organization_id},
+                {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return (
+            cast(CompanyDocument, model_from_document(CompanyDocument, document))
+            if document
+            else None
+        )
+
+
+class MongoDocumentIngestionJobRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, job: DocumentIngestionJob) -> DocumentIngestionJob:
+        await _mongo(self._collection.insert_one(_document(job)))
+        return job
+
+    async def get_by_id(self, organization_id: str, job_id: str) -> DocumentIngestionJob | None:
+        document = await _mongo(
+            self._collection.find_one({"_id": job_id, "organization_id": organization_id})
+        )
+        return (
+            cast(
+                DocumentIngestionJob,
+                model_from_document(DocumentIngestionJob, document),
+            )
+            if document
+            else None
+        )
+
+    async def update_progress(
+        self,
+        organization_id: str,
+        job_id: str,
+        stage: DocumentStage,
+        progress_percent: int,
+        message: str,
+        metrics: Mapping[str, int] | None = None,
+    ) -> DocumentIngestionJob | None:
+        changes: dict[str, Any] = {
+            "status": DocumentJobStatus.RUNNING,
+            "stage": stage,
+            "progress_percent": progress_percent,
+            "message": message,
+            "started_at": utc_now(),
+        }
+        changes.update(metrics or {})
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"_id": job_id, "organization_id": organization_id},
+                {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return (
+            cast(
+                DocumentIngestionJob,
+                model_from_document(DocumentIngestionJob, document),
+            )
+            if document
+            else None
+        )
+
+    async def finalize(
+        self,
+        organization_id: str,
+        job_id: str,
+        status: DocumentJobStatus,
+        *,
+        warning_codes: list[str] | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> DocumentIngestionJob | None:
+        succeeded = status == DocumentJobStatus.SUCCEEDED
+        changes: dict[str, Any] = {
+            "status": status,
+            "stage": DocumentStage.COMPLETED if succeeded else DocumentStage.FAILED,
+            "message": (
+                "Company knowledge is ready."
+                if succeeded
+                else "The document could not be processed."
+            ),
+            "warning_codes": warning_codes or [],
+            "error_code": error_code,
+            "error_message": error_message,
+            "completed_at": utc_now(),
+        }
+        if succeeded:
+            changes["progress_percent"] = 100
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"_id": job_id, "organization_id": organization_id},
+                {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return (
+            cast(
+                DocumentIngestionJob,
+                model_from_document(DocumentIngestionJob, document),
+            )
+            if document
+            else None
+        )
+
+
+class MongoCompanyKnowledgeChunkRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create_many(self, chunks: list[CompanyKnowledgeChunk]) -> list[CompanyKnowledgeChunk]:
+        if chunks:
+            await _mongo(self._collection.insert_many([_document(item) for item in chunks]))
+        return chunks
+
+    async def get_many(
+        self, organization_id: str, chunk_ids: list[str]
+    ) -> list[CompanyKnowledgeChunk]:
+        cursor = self._collection.find(
+            {
+                "organization_id": organization_id,
+                "_id": {"$in": chunk_ids},
+                "active": True,
+            }
+        )
+        return [
+            cast(
+                CompanyKnowledgeChunk,
+                model_from_document(CompanyKnowledgeChunk, item),
+            )
+            async for item in cursor
+        ]
+
+    async def list_for_document_version(
+        self, organization_id: str, document_id: str, version: int
+    ) -> list[CompanyKnowledgeChunk]:
+        cursor = self._collection.find(
+            {
+                "organization_id": organization_id,
+                "document_id": document_id,
+                "document_version": version,
+            }
+        ).sort("chunk_index", ASCENDING)
+        return [
+            cast(
+                CompanyKnowledgeChunk,
+                model_from_document(CompanyKnowledgeChunk, item),
+            )
+            async for item in cursor
+        ]
+
+    async def activate_version(self, organization_id: str, document_id: str, version: int) -> None:
+        await _mongo(
+            self._collection.update_many(
+                {"organization_id": organization_id, "document_id": document_id},
+                [{"$set": {"active": {"$eq": ["$document_version", version]}}}],
+            )
+        )
+
+    async def delete_version(self, organization_id: str, document_id: str, version: int) -> None:
+        await _mongo(
+            self._collection.delete_many(
+                {
+                    "organization_id": organization_id,
+                    "document_id": document_id,
+                    "document_version": version,
+                }
+            )
+        )
+
+    async def delete_for_document(self, organization_id: str, document_id: str) -> None:
+        await _mongo(
+            self._collection.delete_many(
+                {"organization_id": organization_id, "document_id": document_id}
+            )
         )
 
 
@@ -1219,6 +1457,9 @@ class MongoPersistence:
         self.idempotency_records: MongoIdempotencyRepository
         self.snapshots: MongoSnapshotRepository
         self.company_intelligence_profiles: MongoCompanyIntelligenceRepository
+        self.company_documents: MongoCompanyDocumentRepository
+        self.document_ingestion_jobs: MongoDocumentIngestionJobRepository
+        self.company_knowledge_chunks: MongoCompanyKnowledgeChunkRepository
         self.discovery_jobs: MongoDiscoveryJobRepository
         self.competitor_candidates: MongoCompetitorCandidateRepository
         self.competitors: MongoCompetitorRepository
@@ -1244,6 +1485,13 @@ class MongoPersistence:
         self.snapshots = MongoSnapshotRepository(self._database["snapshots"])
         self.company_intelligence_profiles = MongoCompanyIntelligenceRepository(
             self._database["company_intelligence_profiles"]
+        )
+        self.company_documents = MongoCompanyDocumentRepository(self._database["company_documents"])
+        self.document_ingestion_jobs = MongoDocumentIngestionJobRepository(
+            self._database["document_ingestion_jobs"]
+        )
+        self.company_knowledge_chunks = MongoCompanyKnowledgeChunkRepository(
+            self._database["company_knowledge_chunks"]
         )
         self.discovery_jobs = MongoDiscoveryJobRepository(
             self._database["competitor_discovery_jobs"]
@@ -1346,6 +1594,50 @@ class MongoPersistence:
             await intelligence.create_index(
                 [("organization_id", ASCENDING), ("company_profile_id", ASCENDING)],
                 unique=True,
+            )
+            documents = self._database["company_documents"]
+            await documents.create_index(
+                [("organization_id", ASCENDING), ("created_at", DESCENDING)]
+            )
+            await documents.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("company_profile_id", ASCENDING),
+                    ("status", ASCENDING),
+                ]
+            )
+            await documents.create_index(
+                [("organization_id", ASCENDING), ("storage_key", ASCENDING)],
+                unique=True,
+            )
+            document_jobs = self._database["document_ingestion_jobs"]
+            await document_jobs.create_index(
+                [("organization_id", ASCENDING), ("document_id", ASCENDING)]
+            )
+            await document_jobs.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("document_id", ASCENDING),
+                    ("version", ASCENDING),
+                ],
+                unique=True,
+            )
+            chunks = self._database["company_knowledge_chunks"]
+            await chunks.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("document_id", ASCENDING),
+                    ("document_version", ASCENDING),
+                    ("chunk_index", ASCENDING),
+                ],
+                unique=True,
+            )
+            await chunks.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("company_profile_id", ASCENDING),
+                    ("active", ASCENDING),
+                ]
             )
             discovery_jobs = self._database["competitor_discovery_jobs"]
             await discovery_jobs.create_index(

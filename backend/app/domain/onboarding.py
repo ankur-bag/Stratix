@@ -218,6 +218,8 @@ class CompanyFields(BaseModel):
 class CompanyOnboardingRequest(CompanyFields):
     """Payload accepted for the first company onboarding submission."""
 
+    document_ids: list[str] = Field(default_factory=list, max_length=1)
+
 
 class CompanyProfile(CompanyFields):
     """Persisted primary company profile for an organization."""

@@ -25,7 +25,7 @@ body {
   font-family: "Segoe UI", ui-sans-serif, sans-serif;
 }
 
-:where(a[href], button:not(:disabled), summary, [role="button"]:not([aria-disabled="true"])) {
+:where(a[href], button:not(:disabled), summary, select:not(:disabled), input[type="file"]:not(:disabled), input[type="checkbox"]:not(:disabled), input[type="radio"]:not(:disabled), [role="button"]:not([aria-disabled="true"])) {
   cursor: pointer;
 }
 

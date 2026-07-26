@@ -2,7 +2,7 @@
 
 import { useOrganization } from "@clerk/nextjs";
 import { useRouter, useSearchParams } from "next/navigation";
-import { FormEvent, useEffect, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { ApiError } from "@/lib/api/client";
 import type {
   CompanyOnboardingRequest,
@@ -11,6 +11,11 @@ import type {
 } from "@/lib/api/types";
 import { useAuthenticatedApi } from "@/lib/api/use-api";
 import { routeForOnboardingStatus } from "@/lib/auth/workspace-routing";
+import {
+  maximumCompanyPdfSize,
+  onboardingDocumentIds,
+  validateCompanyPdf,
+} from "@/lib/documents";
 
 type FormState = {
   companyName: string;
@@ -62,6 +67,11 @@ function errorMessage(error: unknown): string {
   return "Company setup could not be submitted. Check the details and try again.";
 }
 
+async function fileSha256(file: File): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
 export function OnboardingForm() {
   const { isLoaded, organization } = useOrganization();
   const router = useRouter();
@@ -91,6 +101,10 @@ function ActiveCompanyOnboardingForm({ companyName, websiteUrl }: { companyName:
   const [checking, setChecking] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [pdf, setPdf] = useState<File | null>(null);
+  const [uploadStage, setUploadStage] = useState<string | null>(null);
+  const [canCancelUpload, setCanCancelUpload] = useState(false);
+  const uploadController = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -121,6 +135,30 @@ function ActiveCompanyOnboardingForm({ companyName, websiteUrl }: { companyName:
     setSubmitting(true);
     setMessage(null);
     try {
+      let documentIds: string[] = [];
+      if (pdf) {
+        const controller = new AbortController();
+        uploadController.current = controller;
+        setCanCancelUpload(true);
+        setUploadStage("Preparing secure upload");
+        const upload = await api.createDocumentUpload(pdf);
+        try {
+          setUploadStage("Uploading PDF");
+          await api.uploadDocumentContent(upload.upload, pdf, controller.signal);
+          setUploadStage("Verifying PDF");
+          const digest = await fileSha256(pdf);
+          const document = await api.completeDocumentUpload(upload.document.id, digest, pdf.size);
+          documentIds = onboardingDocumentIds(document.id);
+        } catch (uploadError) {
+          if (uploadError instanceof ApiError && uploadError.kind === "cancelled") {
+            await api.deleteCompanyDocument(upload.document.id).catch(() => undefined);
+          }
+          throw uploadError;
+        } finally {
+          uploadController.current = null;
+          setCanCancelUpload(false);
+        }
+      }
       const payload: CompanyOnboardingRequest = {
         company_name: form.companyName,
         website_url: form.websiteUrl,
@@ -135,7 +173,9 @@ function ActiveCompanyOnboardingForm({ companyName, websiteUrl }: { companyName:
         keywords: list(form.keywords),
         known_competitors: list(form.knownCompetitors),
         strategic_goals: list(form.strategicGoals),
+        document_ids: documentIds,
       };
+      setUploadStage(pdf ? "Starting document processing" : null);
       const response = await api.request<OnboardingResponse>("/api/v1/onboarding/company", {
         method: "POST",
         headers: { "Idempotency-Key": `onboarding:${crypto.randomUUID()}` },
@@ -151,7 +191,30 @@ function ActiveCompanyOnboardingForm({ companyName, websiteUrl }: { companyName:
       ) return;
       setMessage(errorMessage(error));
       setSubmitting(false);
+      setUploadStage(null);
+      setCanCancelUpload(false);
     }
+  }
+
+  function choosePdf(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    setMessage(null);
+    if (!file) {
+      setPdf(null);
+      return;
+    }
+    const validationMessage = validateCompanyPdf(file);
+    if (validationMessage) {
+      setMessage(validationMessage);
+      event.target.value = "";
+      return;
+    }
+    setPdf(file);
+  }
+
+  function cancelUpload() {
+    uploadController.current?.abort();
+    setUploadStage("Cancelling upload");
   }
 
   return (
@@ -175,6 +238,31 @@ function ActiveCompanyOnboardingForm({ companyName, websiteUrl }: { companyName:
         <Field label="Keywords" multiline placeholder="competitive intelligence, strategy" value={form.keywords} onChange={(value) => update("keywords", value)} />
         <Field label="Known competitors" multiline placeholder="Company A, Company B" value={form.knownCompetitors} onChange={(value) => update("knownCompetitors", value)} />
         <Field label="Strategic goals" multiline required value={form.strategicGoals} onChange={(value) => update("strategicGoals", value)} />
+        <div className="grid gap-3 border-t border-black/10 pt-5 dark:border-white/10 sm:col-span-2">
+          <div>
+            <p className="text-sm font-medium">Company knowledge PDF <span className="font-normal text-zinc-500">(optional)</span></p>
+            <p className="mt-1 text-sm text-zinc-500">Add one private, text-based PDF up to {maximumCompanyPdfSize / 1024 / 1024} MB and 100 pages. Scanned PDFs are not supported yet.</p>
+          </div>
+          <div className="flex flex-col gap-3 rounded-xl border border-dashed border-black/20 p-4 dark:border-white/20 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="truncate text-sm font-medium">{pdf?.name ?? "No PDF selected"}</p>
+              <p className="mt-1 text-xs text-zinc-500">{pdf ? `${(pdf.size / 1024 / 1024).toFixed(1)} MB · ready to upload` : "PDF only · private to this workspace"}</p>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              {pdf && !submitting ? <button className="rounded-full border border-black/15 px-4 py-2 text-sm dark:border-white/15" onClick={() => setPdf(null)} type="button">Remove</button> : null}
+              <label className="cursor-pointer rounded-full bg-zinc-100 px-4 py-2 text-sm font-medium dark:bg-zinc-800">
+                {pdf ? "Replace PDF" : "Choose PDF"}
+                <input accept="application/pdf,.pdf" className="sr-only" disabled={submitting} onChange={choosePdf} type="file" />
+              </label>
+            </div>
+          </div>
+          {uploadStage ? (
+            <div aria-live="polite" className="flex items-center justify-between rounded-lg bg-zinc-50 px-4 py-3 text-sm dark:bg-zinc-900">
+              <span>{uploadStage}…</span>
+              {canCancelUpload ? <button className="font-medium text-red-600 dark:text-red-400" onClick={cancelUpload} type="button">Cancel</button> : null}
+            </div>
+          ) : null}
+        </div>
       </section>
       {message ? <p role="alert" className="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-300">{message}</p> : null}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">

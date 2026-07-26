@@ -25,6 +25,10 @@ from app.middleware import RequestContextMiddleware
 from app.repositories.interfaces import Persistence
 from app.repositories.mongo import MongoPersistence
 from app.services.change_detection import DeterministicChangeDetector
+from app.services.company_documents import (
+    CompanyDocumentService,
+    DocumentIngestionRunner,
+)
 from app.services.competitor_sources import (
     CompetitorSourceService,
     DeterministicCompetitorSourceDiscoveryService,
@@ -39,6 +43,17 @@ from app.services.discovery_provider import (
     TavilyCompetitorSearchProvider,
     UnavailableCompetitorSearchProvider,
 )
+from app.services.document_storage import (
+    FakeObjectStorage,
+    LocalObjectStorage,
+    ObjectStorage,
+    S3ObjectStorage,
+)
+from app.services.embeddings import (
+    DisabledEmbeddingProvider,
+    EmbeddingProvider,
+    GeminiEmbeddingProvider,
+)
 from app.services.extraction import (
     CompanyIntelligenceExtractor,
     DeterministicCompanyIntelligenceExtractor,
@@ -51,6 +66,7 @@ from app.services.initialization import (
 )
 from app.services.normalization import ContentNormalizer
 from app.services.onboarding import CompanyOnboardingService
+from app.services.pdf_processing import DeterministicPdfChunker, PdfExtractor
 from app.services.scanning import (
     CompetitorScanExecutor,
     CompetitorScanService,
@@ -58,6 +74,13 @@ from app.services.scanning import (
     InProcessCompetitorScanExecutor,
 )
 from app.services.signals import CompetitorSignalService, DeterministicSignalBuilder
+from app.services.vector_store import (
+    DisabledVectorStore,
+    FakeVectorStore,
+    PineconeVectorStore,
+    VectorStore,
+    VectorStoreError,
+)
 
 
 def create_app(
@@ -72,6 +95,10 @@ def create_app(
     search_provider: CompetitorSearchProvider | None = None,
     candidate_classifier: CandidateClassifier | None = None,
     competitor_scan_executor: CompetitorScanExecutor | None = None,
+    document_storage: ObjectStorage | None = None,
+    embedding_provider: EmbeddingProvider | None = None,
+    vector_store: VectorStore | None = None,
+    document_background_executor: BackgroundExecutor | None = None,
 ) -> FastAPI:
     """Create and configure a Stratix API application instance."""
     application_settings = settings or get_settings()
@@ -111,10 +138,108 @@ def create_app(
         if application_settings.tavily_api_key
         else UnavailableCompetitorSearchProvider()
     )
+    if document_storage is not None:
+        application_document_storage = document_storage
+    elif (
+        application_settings.document_storage_provider == "fake"
+        or application_settings.app_env == "testing"
+    ):
+        application_document_storage = FakeObjectStorage()
+    elif application_settings.document_storage_provider == "s3":
+        application_document_storage = S3ObjectStorage(
+            bucket=application_settings.document_s3_bucket or "",
+            region=application_settings.document_s3_region,
+            endpoint_url=application_settings.document_s3_endpoint_url,
+            upload_ttl_seconds=application_settings.document_upload_url_ttl_seconds,
+        )
+    else:
+        application_document_storage = LocalObjectStorage(
+            application_settings.document_storage_path
+        )
+    application_embeddings = embedding_provider or (
+        GeminiEmbeddingProvider(
+            api_key=application_settings.gemini_api_key or "",
+            model=application_settings.embedding_model,
+            dimensions=application_settings.embedding_dimensions,
+            document_task_type=application_settings.embedding_document_task_type,
+            query_task_type=application_settings.embedding_query_task_type,
+            batch_size=application_settings.embedding_batch_size,
+            maximum_concurrency=application_settings.embedding_max_concurrency,
+            maximum_retries=application_settings.embedding_max_retries,
+            retry_base_seconds=application_settings.embedding_retry_base_seconds,
+            version=application_settings.embedding_version,
+        )
+        if application_settings.embeddings_enabled
+        else DisabledEmbeddingProvider(
+            application_settings.embedding_dimensions,
+            application_settings.embedding_version,
+        )
+    )
+    if vector_store is not None:
+        application_vectors = vector_store
+    elif not application_settings.vector_search_enabled:
+        application_vectors = DisabledVectorStore()
+    elif application_settings.vector_db_provider == "fake":
+        application_vectors = FakeVectorStore(application_settings.pinecone_dimensions)
+    elif application_settings.vector_db_provider == "disabled":
+        application_vectors = DisabledVectorStore()
+    else:
+        application_vectors = PineconeVectorStore(
+            api_key=application_settings.pinecone_api_key or "",
+            host=application_settings.pinecone_host or "",
+            index_name=application_settings.pinecone_index_name,
+            dimensions=application_settings.pinecone_dimensions,
+            metric=application_settings.pinecone_metric,
+            upsert_batch_size=application_settings.pinecone_upsert_batch_size,
+            maximum_concurrency=application_settings.pinecone_max_concurrency,
+            maximum_retries=application_settings.pinecone_max_retries,
+            retry_base_seconds=application_settings.pinecone_retry_base_seconds,
+        )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         await application_persistence.start()
+        if hasattr(application_document_storage, "start"):
+            await application_document_storage.start()
+        active_vectors = application_vectors
+        try:
+            await active_vectors.start()
+        except VectorStoreError:
+            if application_settings.vector_search_required:
+                await active_vectors.close()
+                raise
+            logger.warning("vector_search_degraded")
+            await active_vectors.close()
+            active_vectors = DisabledVectorStore()
+            await active_vectors.start()
+        document_runner = DocumentIngestionRunner(
+            persistence=application_persistence,
+            storage=application_document_storage,
+            extractor=PdfExtractor(
+                maximum_pages=application_settings.document_max_pages,
+                maximum_characters=application_settings.document_max_extracted_characters,
+            ),
+            chunker=DeterministicPdfChunker(
+                target_characters=application_settings.document_chunk_target_characters,
+                maximum_characters=application_settings.document_chunk_max_characters,
+                overlap_characters=application_settings.document_chunk_overlap_characters,
+                minimum_characters=application_settings.document_chunk_min_characters,
+            ),
+            embeddings=application_embeddings,
+            vectors=active_vectors,
+            settings=application_settings,
+        )
+        document_executor = document_background_executor or InProcessBackgroundExecutor(
+            document_runner
+        )
+        document_service = CompanyDocumentService(
+            persistence=application_persistence,
+            storage=application_document_storage,
+            executor=document_executor,
+            embeddings=application_embeddings,
+            vectors=active_vectors,
+            settings=application_settings,
+        )
         source_service = CompetitorSourceService(application_persistence)
         source_discovery = DeterministicCompetitorSourceDiscoveryService(
             application_persistence,
@@ -175,8 +300,11 @@ def create_app(
         application.state.competitor_signal_service = CompetitorSignalService(
             application_persistence
         )
+        application.state.company_document_service = document_service
+        application.state.document_ingestion_runner = document_runner
+        application.state.document_background_executor = document_executor
         application.state.onboarding_service = CompanyOnboardingService(
-            application_persistence, executor
+            application_persistence, executor, document_service
         )
         application.state.ready = True
         logger.info("application_started", environment=application_settings.app_env)
@@ -188,6 +316,8 @@ def create_app(
             if discovery_executor is not executor:
                 await discovery_executor.close()
             await scan_executor.close()
+            await document_executor.close()
+            await active_vectors.close()
             await application_persistence.close()
             logger.info("application_stopped")
 
@@ -209,7 +339,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=application_settings.frontend_allowed_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=[
             "Authorization",
             "Content-Type",

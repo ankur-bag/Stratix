@@ -75,7 +75,12 @@ class CompanyIntelligenceFields(BaseModel):
     supported_regions: list[str] = Field(default_factory=list, max_length=50)
     integrations: list[str] = Field(default_factory=list, max_length=100)
     keywords: list[str] = Field(default_factory=list, max_length=100)
-    source_snapshot_ids: list[str] = Field(min_length=1, max_length=100)
+    source_snapshot_ids: list[str] = Field(default_factory=list, max_length=100)
+    source_document_ids: list[str] = Field(default_factory=list, max_length=50)
+    source_document_chunk_ids: list[str] = Field(default_factory=list, max_length=200)
+    document_facts: list[str] = Field(default_factory=list, max_length=100)
+    evidence_conflicts: list[str] = Field(default_factory=list, max_length=50)
+    provenance: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class CompanyIntelligenceDraft(CompanyIntelligenceFields):

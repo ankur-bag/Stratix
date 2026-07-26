@@ -17,6 +17,14 @@ from app.domain.discovery import (
     DiscoveryStage,
     RelationshipType,
 )
+from app.domain.documents import (
+    CompanyDocument,
+    CompanyKnowledgeChunk,
+    DocumentIngestionJob,
+    DocumentJobStatus,
+    DocumentStage,
+    DocumentStatus,
+)
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
 from app.domain.monitoring import CompetitorSource
 from app.domain.monitoring import SourceStatus as CompetitorSourceStatus
@@ -970,6 +978,173 @@ class InMemoryCompetitorSignalRepository:
         return updated
 
 
+class InMemoryCompanyDocumentRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, CompanyDocument] = {}
+
+    async def create(self, document: CompanyDocument) -> CompanyDocument:
+        if document.id in self.items:
+            raise RepositoryConflictError
+        self.items[document.id] = document
+        return document
+
+    async def get_by_id(
+        self, organization_id: str, document_id: str, *, include_deleted: bool = False
+    ) -> CompanyDocument | None:
+        item = self.items.get(document_id)
+        if item is None or item.organization_id != organization_id:
+            return None
+        if not include_deleted and item.status == DocumentStatus.DELETED:
+            return None
+        return item
+
+    async def list_for_organization(
+        self, organization_id: str, *, include_deleted: bool = False
+    ) -> list[CompanyDocument]:
+        return sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and (include_deleted or item.status != DocumentStatus.DELETED)
+            ],
+            key=lambda item: (item.created_at, item.id),
+            reverse=True,
+        )
+
+    async def update(
+        self, organization_id: str, document_id: str, changes: Mapping[str, Any]
+    ) -> CompanyDocument | None:
+        item = await self.get_by_id(organization_id, document_id, include_deleted=True)
+        if item is None:
+            return None
+        updated = item.model_copy(update={**changes, "updated_at": utc_now()})
+        self.items[document_id] = updated
+        return updated
+
+
+class InMemoryDocumentIngestionJobRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, DocumentIngestionJob] = {}
+
+    async def create(self, job: DocumentIngestionJob) -> DocumentIngestionJob:
+        self.items[job.id] = job
+        return job
+
+    async def get_by_id(self, organization_id: str, job_id: str) -> DocumentIngestionJob | None:
+        item = self.items.get(job_id)
+        return item if item and item.organization_id == organization_id else None
+
+    async def update_progress(
+        self,
+        organization_id: str,
+        job_id: str,
+        stage: DocumentStage,
+        progress_percent: int,
+        message: str,
+        metrics: Mapping[str, int] | None = None,
+    ) -> DocumentIngestionJob | None:
+        item = await self.get_by_id(organization_id, job_id)
+        if item is None:
+            return None
+        updated = item.model_copy(
+            update={
+                "status": DocumentJobStatus.RUNNING,
+                "stage": stage,
+                "progress_percent": progress_percent,
+                "message": message,
+                "started_at": item.started_at or utc_now(),
+                "updated_at": utc_now(),
+                **dict(metrics or {}),
+            }
+        )
+        self.items[job_id] = updated
+        return updated
+
+    async def finalize(
+        self,
+        organization_id: str,
+        job_id: str,
+        status: DocumentJobStatus,
+        *,
+        warning_codes: list[str] | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> DocumentIngestionJob | None:
+        item = await self.get_by_id(organization_id, job_id)
+        if item is None:
+            return None
+        succeeded = status == DocumentJobStatus.SUCCEEDED
+        updated = item.model_copy(
+            update={
+                "status": status,
+                "stage": (DocumentStage.COMPLETED if succeeded else DocumentStage.FAILED),
+                "progress_percent": 100 if succeeded else item.progress_percent,
+                "warning_codes": warning_codes or [],
+                "error_code": error_code,
+                "error_message": error_message,
+                "completed_at": utc_now(),
+                "updated_at": utc_now(),
+            }
+        )
+        self.items[job_id] = updated
+        return updated
+
+
+class InMemoryCompanyKnowledgeChunkRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, CompanyKnowledgeChunk] = {}
+
+    async def create_many(self, chunks: list[CompanyKnowledgeChunk]) -> list[CompanyKnowledgeChunk]:
+        self.items.update({item.id: item for item in chunks})
+        return chunks
+
+    async def get_many(
+        self, organization_id: str, chunk_ids: list[str]
+    ) -> list[CompanyKnowledgeChunk]:
+        requested = set(chunk_ids)
+        return [
+            item
+            for item in self.items.values()
+            if item.organization_id == organization_id and item.id in requested and item.active
+        ]
+
+    async def list_for_document_version(
+        self, organization_id: str, document_id: str, version: int
+    ) -> list[CompanyKnowledgeChunk]:
+        return sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.document_id == document_id
+                and item.document_version == version
+            ],
+            key=lambda item: item.chunk_index,
+        )
+
+    async def activate_version(self, organization_id: str, document_id: str, version: int) -> None:
+        for key, item in list(self.items.items()):
+            if item.organization_id == organization_id and item.document_id == document_id:
+                self.items[key] = item.model_copy(
+                    update={"active": item.document_version == version}
+                )
+
+    async def delete_version(self, organization_id: str, document_id: str, version: int) -> None:
+        for key, item in list(self.items.items()):
+            if (
+                item.organization_id == organization_id
+                and item.document_id == document_id
+                and item.document_version == version
+            ):
+                self.items.pop(key)
+
+    async def delete_for_document(self, organization_id: str, document_id: str) -> None:
+        for key, item in list(self.items.items()):
+            if item.organization_id == organization_id and item.document_id == document_id:
+                self.items.pop(key)
+
+
 class InMemoryPersistence:
     def __init__(self, *, ready: bool = True) -> None:
         self.company_profiles = InMemoryCompanyProfileRepository()
@@ -978,6 +1153,9 @@ class InMemoryPersistence:
         self.idempotency_records = InMemoryIdempotencyRepository()
         self.snapshots = InMemorySnapshotRepository()
         self.company_intelligence_profiles = InMemoryCompanyIntelligenceRepository()
+        self.company_documents = InMemoryCompanyDocumentRepository()
+        self.document_ingestion_jobs = InMemoryDocumentIngestionJobRepository()
+        self.company_knowledge_chunks = InMemoryCompanyKnowledgeChunkRepository()
         self.discovery_jobs = InMemoryDiscoveryJobRepository()
         self.competitor_candidates = InMemoryCompetitorCandidateRepository()
         self.competitors = InMemoryCompetitorRepository()

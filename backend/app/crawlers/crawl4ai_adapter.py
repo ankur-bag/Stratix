@@ -6,8 +6,10 @@ from collections import deque
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.core.config import Settings
+from app.core.logging import get_logger
 from app.crawlers.models import (
     CrawlError,
     CrawlErrorCode,
@@ -16,6 +18,8 @@ from app.crawlers.models import (
     CrawlResult,
 )
 from app.crawlers.policy import CrawlPolicy, CrawlPolicyViolation
+
+logger = get_logger(__name__)
 
 
 class Crawl4AIWebsiteCrawler:
@@ -137,7 +141,14 @@ class Crawl4AIWebsiteCrawler:
                     message="The company website did not respond within the allowed time.",
                     url=safe_url,
                 )
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "crawl_page_attempt_failed",
+                    hostname=urlsplit(safe_url).hostname,
+                    attempt=attempt + 1,
+                    maximum_attempts=attempts,
+                    exception_type=type(exc).__name__,
+                )
                 if attempt + 1 < attempts:
                     continue
                 return None, CrawlError(

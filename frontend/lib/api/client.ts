@@ -8,6 +8,10 @@ import type {
   CompetitorSourceCreate,
   CompetitorSourcePage,
   CompetitorSourceUpdate,
+  CompanyDocument,
+  DocumentIngestionJob,
+  DocumentUploadResponse,
+  ReinitializeResponse,
   SignalPage,
 } from "./types";
 
@@ -158,6 +162,15 @@ export class ApiClient {
     return this.request("/api/v1/competitors", { signal });
   }
 
+  reinitializeCompany(
+    idempotencyKey = createIdempotencyKey("reinitialize"),
+  ): Promise<ReinitializeResponse> {
+    return this.request("/api/v1/company/reinitialize", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+    });
+  }
+
   getCompetitor(competitorId: string, signal?: AbortSignal): Promise<Competitor> {
     return this.request(`/api/v1/competitors/${encodeURIComponent(competitorId)}`, { signal });
   }
@@ -251,6 +264,95 @@ export class ApiClient {
     return this.request(`/api/v1/signals/${encodeURIComponent(signalId)}`, {
       method: "PATCH",
       body: JSON.stringify({ status }),
+    });
+  }
+
+  createDocumentUpload(file: File): Promise<DocumentUploadResponse> {
+    return this.request("/api/v1/company-documents/upload-requests", {
+      method: "POST",
+      body: JSON.stringify({
+        filename: file.name,
+        content_type: "application/pdf",
+        size_bytes: file.size,
+      }),
+    });
+  }
+
+  async uploadDocumentContent(
+    target: DocumentUploadResponse["upload"],
+    file: File,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const headers = new Headers(target.headers);
+    headers.set("Content-Type", "application/pdf");
+    if (/^https?:\/\//i.test(target.url)) {
+      let targetOrigin: string;
+      let apiOrigin: string;
+      try {
+        targetOrigin = new URL(target.url).origin;
+        apiOrigin = new URL(this.baseUrl).origin;
+      } catch {
+        throw new ApiError("The upload destination is invalid.", "backend", "DOCUMENT_UPLOAD_TARGET_INVALID", null);
+      }
+      if (targetOrigin !== apiOrigin) {
+        let response: Response;
+        try {
+          response = await fetch(target.url, {
+            method: target.method,
+            headers,
+            body: file,
+            signal,
+          });
+        } catch (error) {
+          if (isAbortError(error)) {
+            throw new ApiError("The request was cancelled.", "cancelled", "REQUEST_CANCELLED", null);
+          }
+          throw new ApiError("The PDF upload failed.", "network", "DOCUMENT_UPLOAD_FAILED", null);
+        }
+        if (!response.ok) {
+          throw new ApiError("The PDF upload failed.", "network", "DOCUMENT_UPLOAD_FAILED", response.status);
+        }
+        return;
+      }
+      target = { ...target, url: new URL(target.url).pathname };
+    }
+    await this.request<CompanyDocument>(
+      target.url,
+      { method: target.method, headers, body: file, signal },
+    );
+  }
+
+  completeDocumentUpload(
+    documentId: string,
+    sha256: string,
+    sizeBytes: number,
+  ): Promise<CompanyDocument> {
+    return this.request(`/api/v1/company-documents/${encodeURIComponent(documentId)}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ sha256, size_bytes: sizeBytes }),
+    });
+  }
+
+  listCompanyDocuments(signal?: AbortSignal): Promise<{ items: CompanyDocument[] }> {
+    return this.request("/api/v1/company-documents", { signal });
+  }
+
+  getDocumentIngestionJob(
+    jobId: string,
+    signal?: AbortSignal,
+  ): Promise<DocumentIngestionJob> {
+    return this.request(`/api/v1/document-ingestion-jobs/${encodeURIComponent(jobId)}`, { signal });
+  }
+
+  reprocessCompanyDocument(documentId: string): Promise<DocumentIngestionJob> {
+    return this.request(`/api/v1/company-documents/${encodeURIComponent(documentId)}/reprocess`, {
+      method: "POST",
+    });
+  }
+
+  deleteCompanyDocument(documentId: string): Promise<void> {
+    return this.request(`/api/v1/company-documents/${encodeURIComponent(documentId)}`, {
+      method: "DELETE",
     });
   }
 

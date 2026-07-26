@@ -4,6 +4,7 @@ from fastapi import Depends, Request, status
 
 from app.api.errors import AppError
 from app.core.auth import AuthenticatedContext, AuthenticationFailure, AuthenticationVerifier
+from app.services.company_documents import CompanyDocumentService
 from app.services.competitor_sources import CompetitorSourceService
 from app.services.discovery import CompetitorDiscoveryService
 from app.services.onboarding import CompanyOnboardingService
@@ -79,6 +80,10 @@ def get_signal_service(request: Request) -> CompetitorSignalService:
     return cast(CompetitorSignalService, request.app.state.competitor_signal_service)
 
 
+def get_company_document_service(request: Request) -> CompanyDocumentService:
+    return cast(CompanyDocumentService, request.app.state.company_document_service)
+
+
 Authenticated = Annotated[AuthenticatedContext, Depends(require_active_organization)]
 OnboardingService = Annotated[CompanyOnboardingService, Depends(get_onboarding_service)]
 DiscoveryService = Annotated[CompetitorDiscoveryService, Depends(get_discovery_service)]
@@ -87,3 +92,4 @@ CompetitorSourcesService = Annotated[
 ]
 CompetitorScansService = Annotated[CompetitorScanService, Depends(get_competitor_scan_service)]
 SignalsService = Annotated[CompetitorSignalService, Depends(get_signal_service)]
+CompanyDocumentsService = Annotated[CompanyDocumentService, Depends(get_company_document_service)]

@@ -72,6 +72,52 @@ class Settings(BaseSettings):
     change_ignore_footer: bool = True
     change_ignore_cookie_banners: bool = True
     llm_enabled: bool = False
+    document_storage_provider: Literal["local", "s3", "fake"] = "local"
+    document_storage_path: str = ".data/company-documents"
+    document_s3_bucket: str | None = None
+    document_s3_endpoint_url: str | None = None
+    document_s3_region: str = "us-east-1"
+    document_upload_url_ttl_seconds: int = 900
+    document_max_files_per_company: int = 10
+    document_onboarding_max_files: int = 1
+    document_max_file_size_bytes: int = 20_971_520
+    document_max_pages: int = 100
+    document_max_extracted_characters: int = 2_000_000
+    document_chunk_target_characters: int = 3500
+    document_chunk_max_characters: int = 5000
+    document_chunk_overlap_characters: int = 500
+    document_chunk_min_characters: int = 150
+    document_ingestion_max_concurrency: int = 2
+    document_database_batch_size: int = 100
+    document_progress_update_interval: int = 10
+    gemini_api_key: str | None = None
+    embeddings_enabled: bool = False
+    embedding_provider: Literal["gemini"] = "gemini"
+    embedding_model: str = "gemini-embedding-001"
+    embedding_dimensions: int = 768
+    embedding_document_task_type: str = "RETRIEVAL_DOCUMENT"
+    embedding_query_task_type: str = "RETRIEVAL_QUERY"
+    embedding_batch_size: int = 32
+    embedding_max_concurrency: int = 2
+    embedding_max_retries: int = 3
+    embedding_retry_base_seconds: float = 1
+    embedding_version: str = "gemini-embedding-001-768-v1"
+    vector_db_provider: Literal["pinecone", "disabled", "fake"] = "pinecone"
+    vector_search_enabled: bool = False
+    vector_search_required: bool = False
+    pinecone_api_key: str | None = None
+    pinecone_index_name: str = "stratix-knowledge"
+    pinecone_host: str | None = None
+    pinecone_dimensions: int = 768
+    pinecone_metric: Literal["cosine"] = "cosine"
+    pinecone_namespace_prefix: str = "stratix-org-"
+    pinecone_upsert_batch_size: int = 100
+    pinecone_max_concurrency: int = 2
+    pinecone_max_retries: int = 3
+    pinecone_retry_base_seconds: float = 1
+    pinecone_default_top_k: int = 8
+    pinecone_max_top_k: int = 30
+    pinecone_query_overfetch_factor: int = 3
 
     @model_validator(mode="after")
     def reject_insecure_production_auth(self) -> "Settings":
@@ -120,7 +166,17 @@ class Settings(BaseSettings):
             raise ValueError("Configuration values must not be blank")
         return value.strip()
 
-    @field_validator("clerk_secret_key", "clerk_jwt_key", "tavily_api_key", mode="before")
+    @field_validator(
+        "clerk_secret_key",
+        "clerk_jwt_key",
+        "tavily_api_key",
+        "gemini_api_key",
+        "pinecone_api_key",
+        "pinecone_host",
+        "document_s3_bucket",
+        "document_s3_endpoint_url",
+        mode="before",
+    )
     @classmethod
     def normalize_optional_secrets(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
@@ -222,6 +278,65 @@ class Settings(BaseSettings):
         )
         if any(weight < 0 for weight in weights) or abs(sum(weights) - 1.0) > 0.0001:
             raise ValueError("Discovery score weights must be non-negative and sum to 1")
+        return self
+
+    @model_validator(mode="after")
+    def validate_document_intelligence_configuration(self) -> "Settings":
+        positive_values = (
+            self.document_upload_url_ttl_seconds,
+            self.document_max_files_per_company,
+            self.document_onboarding_max_files,
+            self.document_max_file_size_bytes,
+            self.document_max_pages,
+            self.document_max_extracted_characters,
+            self.document_chunk_target_characters,
+            self.document_chunk_max_characters,
+            self.document_chunk_min_characters,
+            self.document_ingestion_max_concurrency,
+            self.document_database_batch_size,
+            self.document_progress_update_interval,
+            self.embedding_dimensions,
+            self.embedding_batch_size,
+            self.embedding_max_concurrency,
+            self.pinecone_dimensions,
+            self.pinecone_upsert_batch_size,
+            self.pinecone_max_concurrency,
+            self.pinecone_default_top_k,
+            self.pinecone_max_top_k,
+            self.pinecone_query_overfetch_factor,
+        )
+        if any(value <= 0 for value in positive_values):
+            raise ValueError("Document intelligence limits must be positive")
+        if self.document_onboarding_max_files > self.document_max_files_per_company:
+            raise ValueError("Onboarding document limit cannot exceed the company limit")
+        if self.document_chunk_target_characters > self.document_chunk_max_characters:
+            raise ValueError("Document chunk target cannot exceed the maximum")
+        if not 0 <= self.document_chunk_overlap_characters < self.document_chunk_target_characters:
+            raise ValueError("Document chunk overlap must be smaller than the target")
+        if self.embedding_dimensions != 768 or self.pinecone_dimensions != 768:
+            raise ValueError("Phase 4.5 requires 768-dimensional embeddings and vectors")
+        if self.embedding_dimensions != self.pinecone_dimensions:
+            raise ValueError("Embedding and Pinecone dimensions must match")
+        if self.pinecone_default_top_k > self.pinecone_max_top_k:
+            raise ValueError("Default vector top-k cannot exceed the maximum")
+        if self.embeddings_enabled and not self.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is required when embeddings are enabled")
+        if (
+            self.vector_search_enabled
+            and self.vector_db_provider == "pinecone"
+            and (not self.pinecone_api_key or not self.pinecone_host)
+        ):
+            raise ValueError(
+                "PINECONE_API_KEY and PINECONE_HOST are required when vector search is enabled"
+            )
+        if self.vector_search_required and not self.vector_search_enabled:
+            raise ValueError("Required vector search must be enabled")
+        if self.vector_search_enabled and not self.embeddings_enabled:
+            raise ValueError("Vector search requires embeddings")
+        if self.vector_search_required and self.vector_db_provider == "disabled":
+            raise ValueError("Required vector search cannot use the disabled provider")
+        if self.document_storage_provider == "s3" and not self.document_s3_bucket:
+            raise ValueError("DOCUMENT_S3_BUCKET is required for S3 document storage")
         return self
 
 

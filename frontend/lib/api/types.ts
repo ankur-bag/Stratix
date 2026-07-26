@@ -29,6 +29,7 @@ export type CompanyOnboardingRequest = {
   keywords: string[];
   known_competitors: string[];
   strategic_goals: string[];
+  document_ids?: string[];
 };
 
 export type OnboardingResponse = {
@@ -37,6 +38,65 @@ export type OnboardingResponse = {
 };
 
 export type InitializationJob = JobSummary & {
+  error_code: string | null;
+  error_message: string | null;
+};
+
+export type ReinitializeResponse = {
+  initialization_job_id: string;
+  status: string;
+  stage: string;
+  progress_percent: number;
+};
+
+export type CompanyDocument = {
+  id: string;
+  company_profile_id: string | null;
+  original_filename: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string | null;
+  page_count: number | null;
+  status: "pending_upload" | "uploaded" | "processing" | "ready" | "failed" | "deleted";
+  stage: "awaiting_upload" | "uploaded" | "validating" | "extracting_text" | "chunking" | "embedding" | "storing_vectors" | "completed" | "failed" | "deleted";
+  progress_percent: number;
+  chunk_count: number;
+  active_version: number | null;
+  ingestion_job_id: string | null;
+  warning_codes: string[];
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+};
+
+export type DocumentUploadRequest = {
+  filename: string;
+  content_type: "application/pdf";
+  size_bytes: number;
+};
+
+export type DocumentUploadResponse = {
+  document: CompanyDocument;
+  upload: {
+    method: string;
+    url: string;
+    headers: Record<string, string>;
+  };
+};
+
+export type DocumentIngestionJob = {
+  id: string;
+  document_id: string;
+  version: number;
+  status: "queued" | "running" | "succeeded" | "failed";
+  stage: CompanyDocument["stage"];
+  progress_percent: number;
+  message: string;
+  page_count: number;
+  chunk_count: number;
+  vector_count: number;
+  warning_codes: string[];
   error_code: string | null;
   error_message: string | null;
 };

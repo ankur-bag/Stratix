@@ -88,6 +88,18 @@ The initial scan establishes evidence and intentionally shows no change signal. 
 
 The authenticated client in `lib/api/client.ts` owns every monitoring request, asks Clerk for a token for each call, encodes resource IDs, generates idempotency keys for scan/discovery writes, and parses the backend error envelope. Tokens are never stored in browser storage.
 
+## Private company knowledge
+
+Onboarding accepts one optional private PDF (20 MB and 100 pages maximum). The browser obtains an opaque upload target from FastAPI, uploads the PDF, verifies completion with SHA-256, and includes only the resulting `document_id` in onboarding. Upload can be cancelled and failures remain retryable without exposing storage, embedding, index, namespace, or provider credentials.
+
+Settings includes the Organization-scoped Company knowledge section with filename, upload date, size, pages, processing stage, progress, chunks, user-safe warnings, rebuild, and delete actions. Switching the active Clerk Organization aborts in-flight reads and clears document state through the existing Organization-bound API client. Scanned/image-only and password-protected PDFs are not supported yet.
+
+For local verification, start the backend, run `npm run dev`, sign in through
+Clerk, select an Organization, and exercise onboarding upload and Settings
+document management. Use only authorized test PDFs. Provider credentials and
+the Pinecone host belong exclusively in `backend/.env`; they must never be
+added to browser-exposed configuration or a `NEXT_PUBLIC_*` variable.
+
 ## Validation
 
 ```powershell

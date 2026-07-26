@@ -132,6 +132,95 @@ Without `TAVILY_API_KEY`, no live search is attempted and a scheduled job ends w
 
 The in-process executor is not durable. A process restart can interrupt initialization or discovery jobs; persisted progress remains available, but automatic recovery requires a later durable queue.
 
+## Private company PDF knowledge
+
+Phase 4.5 accepts private, text-based PDFs during onboarding and from Settings. The browser requests an opaque upload target, uploads directly to local private storage or an S3-compatible bucket, and completes the upload with its size and SHA-256 digest. The API then validates and extracts the PDF with PyMuPDF, creates deterministic page-aware chunks in MongoDB, optionally embeds them with Gemini, and stores only 768-dimensional vectors plus bounded identifiers in the existing Pinecone index.
+
+MongoDB remains canonical for document metadata and chunk text. Pinecone contains no full text and uses one server-derived namespace per verified Clerk Organization (`stratix-org-{org_id}`). Search always queries that namespace, then rechecks each active chunk and document against MongoDB before returning canonical excerpts. The API never accepts an Organization or Pinecone namespace from the browser.
+
+The initial limits are one optional onboarding PDF, 20 MB, 100 pages, and ten documents per company. Encrypted, malformed, image-only, and over-limit PDFs fail with stable document error codes. OCR, office files, URLs as document input, and client-selected namespaces are not supported. Failed reprocessing keeps the previous active version searchable.
+
+`DOCUMENT_STORAGE_PROVIDER=local` is the private development default and writes under the ignored `DOCUMENT_STORAGE_PATH`. Set it to `s3` with a private bucket for presigned uploads. Embeddings and vector search are disabled by default. To enable them, configure the Gemini and Pinecone placeholders in `.env.example`; `PINECONE_HOST` is required for data operations. Startup validates the existing `stratix-knowledge` index dimension (768), metric (cosine), and readiness and never creates or deletes an index. Optional vector failure degrades document search while Mongo-backed company knowledge remains usable; `VECTOR_SEARCH_REQUIRED=true` makes readiness fail instead.
+
+Document APIs:
+
+- `POST /api/v1/company-documents/upload-requests`
+- `PUT /api/v1/company-documents/{document_id}/content` (local development)
+- `POST /api/v1/company-documents/{document_id}/complete`
+- `GET /api/v1/company-documents` and `GET /api/v1/company-documents/{document_id}`
+- `DELETE /api/v1/company-documents/{document_id}`
+- `POST /api/v1/company-documents/{document_id}/reprocess`
+- `GET /api/v1/document-ingestion-jobs/{job_id}`
+- `POST /api/v1/company/knowledge/search`
+
+The offline benchmark and Pinecone diagnostic are available as:
+
+```powershell
+uv run python scripts/benchmark_document_ingestion.py
+uv run python scripts/check_pinecone.py
+uv run python scripts/check_pinecone.py --smoke-test
+```
+
+The diagnostic only describes and validates the configured manual index. Its optional smoke test uses a temporary namespace and deletes only its temporary vectors; it never creates or deletes an index. Live Gemini, Pinecone, S3, and private-document smoke tests require explicit credentials and authorization and were not run by the automated suite.
+
+Add actual provider secrets manually only to `backend/.env`; never commit that
+file. `GEMINI_API_KEY`, `PINECONE_API_KEY`, and `PINECONE_HOST` must not appear
+in `frontend/.env.local`, any `NEXT_PUBLIC_*` variable, browser code, or API
+responses. Copy the complete index host from Pinecone Console; do not copy a
+shortened host shown in a screenshot.
+
+Example provider configuration (placeholders only):
+
+```dotenv
+GEMINI_API_KEY=
+EMBEDDINGS_ENABLED=true
+EMBEDDING_PROVIDER=gemini
+EMBEDDING_MODEL=gemini-embedding-001
+EMBEDDING_DIMENSIONS=768
+EMBEDDING_DOCUMENT_TASK_TYPE=RETRIEVAL_DOCUMENT
+EMBEDDING_QUERY_TASK_TYPE=RETRIEVAL_QUERY
+
+VECTOR_DB_PROVIDER=pinecone
+VECTOR_SEARCH_ENABLED=true
+VECTOR_SEARCH_REQUIRED=false
+PINECONE_API_KEY=
+PINECONE_INDEX_NAME=stratix-knowledge
+PINECONE_HOST=
+PINECONE_DIMENSIONS=768
+PINECONE_METRIC=cosine
+PINECONE_NAMESPACE_PREFIX=stratix-org-
+```
+
+### Authorized manual smoke test
+
+Run this only with explicitly authorized provider accounts and private files:
+
+1. Start the backend and frontend.
+2. Sign in with Clerk.
+3. Select the Avento company.
+4. Upload a valid Avento PDF during onboarding.
+5. Confirm upload completion.
+6. Confirm document processing reaches `ready`.
+7. Confirm MongoDB contains the canonical chunks.
+8. Confirm Pinecone contains records only in Avento's Organization namespace.
+9. Confirm the Pinecone record count increases.
+10. Search for an Avento product or customer-segment question.
+11. Confirm relevant PDF evidence is returned.
+12. Confirm the evidence includes page references.
+13. Switch to another company.
+14. Confirm Avento documents and search results disappear.
+15. Upload a document for the second company.
+16. Confirm a separate Pinecone namespace appears.
+17. Switch back to Avento.
+18. Reprocess the Avento PDF.
+19. Confirm no duplicate active version remains.
+20. Delete the PDF.
+21. Confirm it immediately disappears from semantic search.
+22. Confirm Pinecone cleanup completes.
+23. Confirm website intelligence remains available.
+
+This manual flow was not executed by the offline automated suite.
+
 ## API
 
 Public:

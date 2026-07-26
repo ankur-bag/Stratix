@@ -3,7 +3,7 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { ApiError } from "@/lib/api/client";
-import type { DiscoveryJob, DiscoveryJobResponse, InitializationJob } from "@/lib/api/types";
+import type { CompanyDocument, DiscoveryJob, DiscoveryJobResponse, InitializationJob } from "@/lib/api/types";
 import { useAuthenticatedApi } from "@/lib/api/use-api";
 
 const maximumPolls = 160;
@@ -15,6 +15,8 @@ export function InitializationProgress() {
   const jobId = searchParams.get("jobId");
   const [job, setJob] = useState<InitializationJob | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [documents, setDocuments] = useState<CompanyDocument[]>([]);
 
   const continueToDiscovery = useCallback(async () => {
     let discovery: DiscoveryJob | null = null;
@@ -61,6 +63,8 @@ export function InitializationProgress() {
         );
         if (cancelled) return;
         setJob(current);
+        const documentResponse = await api.listCompanyDocuments(controller.signal);
+        if (!cancelled) setDocuments(documentResponse.items.filter((item) => item.company_profile_id));
         if (current.status === "succeeded") {
           await continueToDiscovery();
           return;
@@ -86,6 +90,26 @@ export function InitializationProgress() {
     };
   }, [api, continueToDiscovery, jobId]);
 
+  async function retryInitialization() {
+    if (retrying) return;
+    setRetrying(true);
+    setError(null);
+    try {
+      const response = await api.reinitializeCompany();
+      setJob(null);
+      router.replace(
+        `/onboarding/progress?jobId=${encodeURIComponent(response.initialization_job_id)}`,
+      );
+    } catch (retryError) {
+      setError(
+        retryError instanceof ApiError
+          ? retryError.message
+          : "Company website collection could not be restarted.",
+      );
+      setRetrying(false);
+    }
+  }
+
   const progress = job?.progress_percent ?? 0;
   const displayedError = error ?? (!jobId ? "The initialization job identifier is missing." : null);
   return (
@@ -104,7 +128,28 @@ export function InitializationProgress() {
       {job?.status === "failed" ? (
         <div className="mt-8 rounded-xl bg-red-50 p-4 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-300">
           <p>{job.error_message ?? "Initialization could not be completed."}</p>
-          <button className="mt-3 font-medium underline" onClick={() => router.push("/onboarding")} type="button">Review company details</button>
+          {job.error_code ? (
+            <p className="mt-2 font-mono text-xs opacity-75">Error code: {job.error_code}</p>
+          ) : null}
+          <button
+            className="mt-4 rounded-full bg-red-700 px-4 py-2 font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 dark:bg-red-300 dark:text-red-950"
+            disabled={retrying}
+            onClick={retryInitialization}
+            type="button"
+          >
+            {retrying ? "Retrying…" : "Retry website collection"}
+          </button>
+        </div>
+      ) : null}
+      {documents.length ? (
+        <div className="mt-6 grid gap-2 border-t border-black/10 pt-5 dark:border-white/10">
+          <p className="text-sm font-medium">Private company knowledge</p>
+          {documents.map((document) => (
+            <div className="flex items-center justify-between gap-4 text-sm" key={document.id}>
+              <span className="min-w-0 truncate text-zinc-600 dark:text-zinc-400">{document.original_filename}</span>
+              <span className="shrink-0 capitalize text-zinc-500">{document.status === "processing" ? `${document.stage.replaceAll("_", " ")} · ${document.progress_percent}%` : document.status}</span>
+            </div>
+          ))}
         </div>
       ) : null}
       {displayedError ? <p role="alert" className="mt-6 text-sm text-red-600 dark:text-red-400">{displayedError}</p> : null}

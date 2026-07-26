@@ -10,6 +10,13 @@ from app.domain.discovery import (
     DiscoveryStage,
     RelationshipType,
 )
+from app.domain.documents import (
+    CompanyDocument,
+    CompanyKnowledgeChunk,
+    DocumentIngestionJob,
+    DocumentJobStatus,
+    DocumentStage,
+)
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
 from app.domain.monitoring import CompetitorSource, SourceStatus
 from app.domain.onboarding import (
@@ -123,6 +130,62 @@ class CompanyIntelligenceRepository(Protocol):
     async def get_for_company(
         self, organization_id: str, company_profile_id: str
     ) -> CompanyIntelligenceProfile | None: ...
+
+
+class CompanyDocumentRepository(Protocol):
+    async def create(self, document: CompanyDocument) -> CompanyDocument: ...
+    async def get_by_id(
+        self, organization_id: str, document_id: str, *, include_deleted: bool = False
+    ) -> CompanyDocument | None: ...
+    async def list_for_organization(
+        self, organization_id: str, *, include_deleted: bool = False
+    ) -> list[CompanyDocument]: ...
+    async def update(
+        self, organization_id: str, document_id: str, changes: Mapping[str, Any]
+    ) -> CompanyDocument | None: ...
+
+
+class DocumentIngestionJobRepository(Protocol):
+    async def create(self, job: DocumentIngestionJob) -> DocumentIngestionJob: ...
+    async def get_by_id(self, organization_id: str, job_id: str) -> DocumentIngestionJob | None: ...
+    async def update_progress(
+        self,
+        organization_id: str,
+        job_id: str,
+        stage: DocumentStage,
+        progress_percent: int,
+        message: str,
+        metrics: Mapping[str, int] | None = None,
+    ) -> DocumentIngestionJob | None: ...
+    async def finalize(
+        self,
+        organization_id: str,
+        job_id: str,
+        status: DocumentJobStatus,
+        *,
+        warning_codes: list[str] | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> DocumentIngestionJob | None: ...
+
+
+class CompanyKnowledgeChunkRepository(Protocol):
+    async def create_many(
+        self, chunks: list[CompanyKnowledgeChunk]
+    ) -> list[CompanyKnowledgeChunk]: ...
+    async def get_many(
+        self, organization_id: str, chunk_ids: list[str]
+    ) -> list[CompanyKnowledgeChunk]: ...
+    async def list_for_document_version(
+        self, organization_id: str, document_id: str, version: int
+    ) -> list[CompanyKnowledgeChunk]: ...
+    async def activate_version(
+        self, organization_id: str, document_id: str, version: int
+    ) -> None: ...
+    async def delete_version(
+        self, organization_id: str, document_id: str, version: int
+    ) -> None: ...
+    async def delete_for_document(self, organization_id: str, document_id: str) -> None: ...
 
 
 class DiscoveryJobRepository(Protocol):
@@ -326,6 +389,9 @@ class Persistence(Protocol):
     idempotency_records: IdempotencyRepository
     snapshots: SnapshotRepository
     company_intelligence_profiles: CompanyIntelligenceRepository
+    company_documents: CompanyDocumentRepository
+    document_ingestion_jobs: DocumentIngestionJobRepository
+    company_knowledge_chunks: CompanyKnowledgeChunkRepository
     discovery_jobs: DiscoveryJobRepository
     competitor_candidates: CompetitorCandidateRepository
     competitors: CompetitorRepository

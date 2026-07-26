@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 from datetime import timedelta
+from typing import Any, Protocol
 
 from fastapi import status
 
@@ -41,12 +42,28 @@ from app.services.initialization import BackgroundExecutor
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 
 
+class OnboardingDocumentService(Protocol):
+    async def attach_for_onboarding(
+        self,
+        *,
+        context: AuthenticatedContext,
+        company_profile_id: str,
+        document_ids: list[str],
+    ) -> Any: ...
+
+
 class CompanyOnboardingService:
     """Coordinate organization-scoped company onboarding and retrieval."""
 
-    def __init__(self, persistence: Persistence, background_executor: BackgroundExecutor) -> None:
+    def __init__(
+        self,
+        persistence: Persistence,
+        background_executor: BackgroundExecutor,
+        document_service: OnboardingDocumentService | None = None,
+    ) -> None:
         self._persistence = persistence
         self._background_executor = background_executor
+        self._document_service = document_service
 
     async def submit(
         self,
@@ -290,7 +307,7 @@ class CompanyOnboardingService:
     ) -> OnboardingResponse:
         now = utc_now()
         company = CompanyProfile(
-            **request.model_dump(mode="python"),
+            **request.model_dump(mode="python", exclude={"document_ids"}),
             id=new_id(),
             organization_id=context.organization_id,
             created_by_user_id=context.user_id,
@@ -341,6 +358,18 @@ class CompanyOnboardingService:
             await self._persistence.initialization_jobs.create(job)
             created_job = True
             await self._persistence.idempotency_records.create(record)
+            if request.document_ids:
+                if self._document_service is None:
+                    raise AppError(
+                        code="DOCUMENT_INGESTION_UNAVAILABLE",
+                        message="Document ingestion is temporarily unavailable.",
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
+                await self._document_service.attach_for_onboarding(
+                    context=context,
+                    company_profile_id=company.id,
+                    document_ids=request.document_ids,
+                )
         except RepositoryConflictError as exc:
             await self._compensate(context.organization_id, company.id, source.id, job.id, key)
             raise self._company_exists_error() from exc
