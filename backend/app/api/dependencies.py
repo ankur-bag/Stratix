@@ -4,9 +4,14 @@ from fastapi import Depends, Request, status
 
 from app.api.errors import AppError
 from app.core.auth import AuthenticatedContext, AuthenticationFailure, AuthenticationVerifier
+from app.services.background_jobs import BackgroundJobService
 from app.services.company_documents import CompanyDocumentService
 from app.services.competitor_sources import CompetitorSourceService
 from app.services.discovery import CompetitorDiscoveryService
+from app.services.intelligence import IntelligenceSearchService
+from app.services.intelligence_jobs import IntelligenceReindexService
+from app.services.monitoring_schedules import MonitoringScheduleService
+from app.services.notifications import NotificationService
 from app.services.onboarding import CompanyOnboardingService
 from app.services.scanning import CompetitorScanService
 from app.services.signals import CompetitorSignalService
@@ -84,6 +89,26 @@ def get_company_document_service(request: Request) -> CompanyDocumentService:
     return cast(CompanyDocumentService, request.app.state.company_document_service)
 
 
+def get_background_job_service(request: Request) -> BackgroundJobService:
+    return cast(BackgroundJobService, request.app.state.background_job_service)
+
+
+def get_monitoring_schedule_service(request: Request) -> MonitoringScheduleService:
+    return cast(MonitoringScheduleService, request.app.state.monitoring_schedule_service)
+
+
+def get_notification_service(request: Request) -> NotificationService:
+    return cast(NotificationService, request.app.state.notification_service)
+
+
+def get_intelligence_search_service(request: Request) -> IntelligenceSearchService:
+    return cast(IntelligenceSearchService, request.app.state.intelligence_search_service)
+
+
+def get_intelligence_reindex_service(request: Request) -> IntelligenceReindexService:
+    return cast(IntelligenceReindexService, request.app.state.intelligence_reindex_service)
+
+
 Authenticated = Annotated[AuthenticatedContext, Depends(require_active_organization)]
 OnboardingService = Annotated[CompanyOnboardingService, Depends(get_onboarding_service)]
 DiscoveryService = Annotated[CompetitorDiscoveryService, Depends(get_discovery_service)]
@@ -93,3 +118,12 @@ CompetitorSourcesService = Annotated[
 CompetitorScansService = Annotated[CompetitorScanService, Depends(get_competitor_scan_service)]
 SignalsService = Annotated[CompetitorSignalService, Depends(get_signal_service)]
 CompanyDocumentsService = Annotated[CompanyDocumentService, Depends(get_company_document_service)]
+BackgroundJobsService = Annotated[BackgroundJobService, Depends(get_background_job_service)]
+MonitoringSchedulesService = Annotated[
+    MonitoringScheduleService, Depends(get_monitoring_schedule_service)
+]
+NotificationsService = Annotated[NotificationService, Depends(get_notification_service)]
+IntelligenceSearch = Annotated[IntelligenceSearchService, Depends(get_intelligence_search_service)]
+IntelligenceReindex = Annotated[
+    IntelligenceReindexService, Depends(get_intelligence_reindex_service)
+]

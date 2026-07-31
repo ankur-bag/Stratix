@@ -26,6 +26,12 @@ from app.domain.documents import (
     DocumentStatus,
 )
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
+from app.domain.intelligence_evidence import (
+    EvidenceSourceKind,
+    EvidenceSourceType,
+    IntelligenceCategory,
+    IntelligenceEvidence,
+)
 from app.domain.monitoring import CompetitorSource
 from app.domain.monitoring import SourceStatus as CompetitorSourceStatus
 from app.domain.onboarding import (
@@ -47,6 +53,12 @@ from app.repositories.interfaces import (
     RepositoryConflictError,
     RepositoryUnavailableError,
     mongo_update_fields,
+)
+from app.repositories.mongo_jobs import (
+    MongoBackgroundJobRepository,
+    MongoMonitoringScheduleRepository,
+    MongoNotificationRepository,
+    MongoServiceInstanceRepository,
 )
 
 Document = dict[str, Any]
@@ -75,7 +87,8 @@ def _document(
     | CompetitorSource
     | CompetitorScanJob
     | CompetitorSnapshot
-    | CompetitorSignal,
+    | CompetitorSignal
+    | IntelligenceEvidence,
 ) -> Document:
     if isinstance(model, CompanyProfile):
         return company_document(model)
@@ -96,6 +109,18 @@ class MongoCompanyProfileRepository:
         except PyMongoError as exc:
             raise RepositoryUnavailableError from exc
         return profile
+
+    async def list_organization_ids(self, *, limit: int) -> list[str]:
+        try:
+            documents = (
+                await self._collection.find({}, {"organization_id": 1, "_id": 0})
+                .sort("organization_id", ASCENDING)
+                .limit(limit)
+                .to_list(length=limit)
+            )
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return [str(item["organization_id"]) for item in documents]
 
     async def get_for_organization(self, organization_id: str) -> CompanyProfile | None:
         document = await _mongo(self._collection.find_one({"organization_id": organization_id}))
@@ -341,6 +366,20 @@ class MongoInitializationJobRepository:
             },
         )
 
+    async def reset_for_retry(
+        self, organization_id: str, job_id: str, message: str
+    ) -> InitializationJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {
+                "status": JobStatus.QUEUED,
+                "stage": JobStage.QUEUED,
+                "message": message,
+                "completed_at": None,
+            },
+        )
+
     async def _update(
         self, organization_id: str, job_id: str, changes: Mapping[str, Any]
     ) -> InitializationJob | None:
@@ -545,6 +584,28 @@ class MongoCompanyDocumentRepository:
             else None
         )
 
+    async def list_expired_pending(
+        self, organization_id: str, *, before: datetime, limit: int
+    ) -> list[CompanyDocument]:
+        try:
+            documents = (
+                await self._collection.find(
+                    {
+                        "organization_id": organization_id,
+                        "status": DocumentStatus.PENDING_UPLOAD.value,
+                        "created_at": {"$lt": before},
+                    }
+                )
+                .sort([("created_at", ASCENDING), ("_id", ASCENDING)])
+                .limit(limit)
+                .to_list(length=limit)
+            )
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return [
+            cast(CompanyDocument, model_from_document(CompanyDocument, item)) for item in documents
+        ]
+
 
 class MongoDocumentIngestionJobRepository:
     def __init__(self, collection: AsyncCollection[Document]) -> None:
@@ -630,6 +691,35 @@ class MongoDocumentIngestionJobRepository:
             self._collection.find_one_and_update(
                 {"_id": job_id, "organization_id": organization_id},
                 {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return (
+            cast(
+                DocumentIngestionJob,
+                model_from_document(DocumentIngestionJob, document),
+            )
+            if document
+            else None
+        )
+
+    async def reset_for_retry(
+        self, organization_id: str, job_id: str, message: str
+    ) -> DocumentIngestionJob | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"_id": job_id, "organization_id": organization_id},
+                {
+                    "$set": mongo_update_fields(
+                        {
+                            "status": DocumentJobStatus.QUEUED,
+                            "stage": DocumentStage.VALIDATING,
+                            "message": message,
+                            "completed_at": None,
+                        },
+                        utc_now(),
+                    )
+                },
                 return_document=ReturnDocument.AFTER,
             )
         )
@@ -1277,6 +1367,20 @@ class MongoCompetitorScanRepository:
             },
         )
 
+    async def reset_for_retry(
+        self, organization_id: str, scan_id: str, message: str
+    ) -> CompetitorScanJob | None:
+        return await self._update(
+            organization_id,
+            scan_id,
+            {
+                "status": ScanStatus.QUEUED,
+                "stage": ScanStage.QUEUED,
+                "message": message,
+                "completed_at": None,
+            },
+        )
+
     async def _update(
         self, organization_id: str, scan_id: str, changes: Mapping[str, Any]
     ) -> CompetitorScanJob | None:
@@ -1349,6 +1453,41 @@ class MongoCompetitorSnapshotRepository:
             if document
             else None
         )
+
+    async def list_for_scan(
+        self, organization_id: str, scan_id: str, *, limit: int = 100
+    ) -> list[CompetitorSnapshot]:
+        documents = await _mongo(
+            self._collection.find({"organization_id": organization_id, "scan_id": scan_id})
+            .sort("_id", ASCENDING)
+            .to_list(length=limit)
+        )
+        return [
+            cast(CompetitorSnapshot, model_from_document(CompetitorSnapshot, item))
+            for item in documents
+        ]
+
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> list[CompetitorSnapshot]:
+        query: Document = {
+            "organization_id": organization_id,
+            "competitor_id": competitor_id,
+        }
+        if cursor:
+            query["_id"] = {"$gt": cursor}
+        documents = await _mongo(
+            self._collection.find(query).sort("_id", ASCENDING).to_list(length=limit)
+        )
+        return [
+            cast(CompetitorSnapshot, model_from_document(CompetitorSnapshot, item))
+            for item in documents
+        ]
 
 
 class MongoCompetitorSignalRepository:
@@ -1444,6 +1583,218 @@ class MongoCompetitorSignalRepository:
         )
 
 
+class MongoIntelligenceEvidenceRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create_many(self, evidence: list[IntelligenceEvidence]) -> list[IntelligenceEvidence]:
+        if not evidence:
+            return []
+        try:
+            await self._collection.insert_many([_document(item) for item in evidence], ordered=True)
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return evidence
+
+    async def get_many(
+        self, organization_id: str, evidence_ids: list[str], *, active_only: bool = True
+    ) -> list[IntelligenceEvidence]:
+        if not evidence_ids:
+            return []
+        query: Document = {
+            "organization_id": organization_id,
+            "_id": {"$in": list(dict.fromkeys(evidence_ids))},
+            "deleted": False,
+        }
+        if active_only:
+            query["active"] = True
+        documents = await _mongo(
+            self._collection.find(query).to_list(length=len(set(evidence_ids)))
+        )
+        return [
+            cast(IntelligenceEvidence, model_from_document(IntelligenceEvidence, item))
+            for item in documents
+        ]
+
+    async def list_for_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> list[IntelligenceEvidence]:
+        documents = await _mongo(
+            self._collection.find(
+                {
+                    "organization_id": organization_id,
+                    "source_kind": source_kind,
+                    self._reference_field(source_kind): source_reference_id,
+                    "version_key": version_key,
+                }
+            )
+            .sort("chunk_index", ASCENDING)
+            .to_list(length=None)
+        )
+        return [
+            cast(IntelligenceEvidence, model_from_document(IntelligenceEvidence, item))
+            for item in documents
+        ]
+
+    async def list_for_source(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        *,
+        active_only: bool = False,
+    ) -> list[IntelligenceEvidence]:
+        query: Document = {
+            "organization_id": organization_id,
+            "source_kind": source_kind,
+            self._reference_field(source_kind): source_reference_id,
+        }
+        if active_only:
+            query.update({"active": True, "deleted": False})
+        documents = await _mongo(
+            self._collection.find(query).sort("chunk_index", ASCENDING).to_list(length=None)
+        )
+        return [
+            cast(IntelligenceEvidence, model_from_document(IntelligenceEvidence, item))
+            for item in documents
+        ]
+
+    async def activate_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> None:
+        base = {
+            "organization_id": organization_id,
+            "source_kind": source_kind,
+            self._reference_field(source_kind): source_reference_id,
+        }
+        await _mongo(self._collection.update_many(base, {"$set": {"active": False}}))
+        await _mongo(
+            self._collection.update_many(
+                {**base, "version_key": version_key, "deleted": False},
+                {"$set": {"active": True, "updated_at": utc_now()}},
+            )
+        )
+
+    async def delete_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> None:
+        await _mongo(
+            self._collection.delete_many(
+                {
+                    "organization_id": organization_id,
+                    "source_kind": source_kind,
+                    self._reference_field(source_kind): source_reference_id,
+                    "version_key": version_key,
+                    "active": False,
+                }
+            )
+        )
+
+    async def deactivate_source(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+    ) -> list[str]:
+        query = {
+            "organization_id": organization_id,
+            "source_kind": source_kind,
+            self._reference_field(source_kind): source_reference_id,
+        }
+        documents = await _mongo(
+            self._collection.find(query, {"vector_id": 1}).to_list(length=None)
+        )
+        await _mongo(
+            self._collection.update_many(
+                query,
+                {"$set": {"active": False, "deleted": True, "updated_at": utc_now()}},
+            )
+        )
+        return [str(item["vector_id"]) for item in documents if item.get("vector_id")]
+
+    async def list_active(
+        self,
+        organization_id: str,
+        *,
+        competitor_id: str | None = None,
+        competitor_ids: list[str] | None = None,
+        categories: list[IntelligenceCategory] | None = None,
+        source_types: list[EvidenceSourceType] | None = None,
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> list[IntelligenceEvidence]:
+        query: Document = {
+            "organization_id": organization_id,
+            "active": True,
+            "deleted": False,
+        }
+        if competitor_id is not None:
+            query["competitor_id"] = competitor_id
+        elif competitor_ids:
+            query["competitor_id"] = {"$in": competitor_ids}
+        if categories:
+            query["category"] = {"$in": categories}
+        if source_types:
+            query["source_type"] = {"$in": source_types}
+        if observed_after is not None or observed_before is not None:
+            query["observed_at"] = {
+                **({"$gte": observed_after} if observed_after is not None else {}),
+                **({"$lte": observed_before} if observed_before is not None else {}),
+            }
+        if cursor:
+            query["_id"] = {"$gt": cursor}
+        documents = await _mongo(
+            self._collection.find(query).sort("_id", ASCENDING).to_list(length=limit)
+        )
+        return [
+            cast(IntelligenceEvidence, model_from_document(IntelligenceEvidence, item))
+            for item in documents
+        ]
+
+    async def count_status(self, organization_id: str) -> tuple[int, int, datetime | None]:
+        active = await _mongo(
+            self._collection.count_documents(
+                {"organization_id": organization_id, "active": True, "deleted": False}
+            )
+        )
+        inactive = await _mongo(
+            self._collection.count_documents(
+                {"organization_id": organization_id, "active": False, "deleted": False}
+            )
+        )
+        latest = await _mongo(
+            self._collection.find_one(
+                {"organization_id": organization_id, "active": True, "deleted": False},
+                sort=[("updated_at", DESCENDING)],
+            )
+        )
+        return int(active), int(inactive), latest.get("updated_at") if latest else None
+
+    @staticmethod
+    def _reference_field(source_kind: EvidenceSourceKind) -> str:
+        return {
+            EvidenceSourceKind.SNAPSHOT: "snapshot_id",
+            EvidenceSourceKind.SIGNAL: "signal_id",
+            EvidenceSourceKind.DOCUMENT: "document_id",
+        }[source_kind]
+
+
 class MongoPersistence:
     """Own the PyMongo client lifecycle, repositories, and collection indexes."""
 
@@ -1466,7 +1817,12 @@ class MongoPersistence:
         self.competitor_sources: MongoCompetitorSourceRepository
         self.competitor_scans: MongoCompetitorScanRepository
         self.competitor_snapshots: MongoCompetitorSnapshotRepository
+        self.intelligence_evidence: MongoIntelligenceEvidenceRepository
         self.competitor_signals: MongoCompetitorSignalRepository
+        self.background_jobs: MongoBackgroundJobRepository
+        self.monitoring_schedules: MongoMonitoringScheduleRepository
+        self.notifications: MongoNotificationRepository
+        self.service_instances: MongoServiceInstanceRepository
 
     async def start(self) -> None:
         self._client = AsyncMongoClient(
@@ -1510,6 +1866,15 @@ class MongoPersistence:
             self._database["competitor_snapshots"]
         )
         self.competitor_signals = MongoCompetitorSignalRepository(self._database["signals"])
+        self.intelligence_evidence = MongoIntelligenceEvidenceRepository(
+            self._database["intelligence_evidence"]
+        )
+        self.background_jobs = MongoBackgroundJobRepository(self._database["background_jobs"])
+        self.monitoring_schedules = MongoMonitoringScheduleRepository(
+            self._database["monitoring_schedules"]
+        )
+        self.notifications = MongoNotificationRepository(self._database["notifications"])
+        self.service_instances = MongoServiceInstanceRepository(self._database["service_instances"])
         if await self.ping():
             await self._create_indexes()
 
@@ -1787,6 +2152,107 @@ class MongoPersistence:
             await signals.create_index([("organization_id", ASCENDING), ("scan_id", ASCENDING)])
             await signals.create_index(
                 [("organization_id", ASCENDING), ("current_snapshot_id", ASCENDING)]
+            )
+            evidence = self._database["intelligence_evidence"]
+            await evidence.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("active", ASCENDING),
+                    ("deleted", ASCENDING),
+                    ("observed_at", DESCENDING),
+                ]
+            )
+            await evidence.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("competitor_id", ASCENDING),
+                    ("category", ASCENDING),
+                    ("observed_at", DESCENDING),
+                ]
+            )
+            await evidence.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("source_kind", ASCENDING),
+                    ("version_key", ASCENDING),
+                ]
+            )
+            await evidence.create_index(
+                [("organization_id", ASCENDING), ("vector_id", ASCENDING)], unique=True
+            )
+            await evidence.create_index(
+                [("organization_id", ASCENDING), ("snapshot_id", ASCENDING)]
+            )
+            await evidence.create_index([("organization_id", ASCENDING), ("signal_id", ASCENDING)])
+            background_jobs = self._database["background_jobs"]
+            await background_jobs.create_index(
+                [
+                    ("status", ASCENDING),
+                    ("available_at", ASCENDING),
+                    ("priority", DESCENDING),
+                    ("created_at", ASCENDING),
+                ]
+            )
+            await background_jobs.create_index(
+                [("status", ASCENDING), ("lease_expires_at", ASCENDING)]
+            )
+            await background_jobs.create_index(
+                [("organization_id", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)]
+            )
+            await background_jobs.create_index(
+                [("organization_id", ASCENDING), ("job_type", ASCENDING), ("status", ASCENDING)]
+            )
+            await background_jobs.create_index(
+                [("organization_id", ASCENDING), ("deduplication_key", ASCENDING)],
+                unique=True,
+                partialFilterExpression={
+                    "status": {
+                        "$in": [
+                            "queued",
+                            "claimed",
+                            "running",
+                            "retry_scheduled",
+                            "cancel_requested",
+                        ]
+                    }
+                },
+            )
+            await background_jobs.create_index(
+                [
+                    ("domain_resource_type", ASCENDING),
+                    ("domain_resource_id", ASCENDING),
+                    ("created_at", DESCENDING),
+                ]
+            )
+            await background_jobs.create_index([("worker_id", ASCENDING), ("status", ASCENDING)])
+            await background_jobs.create_index("completed_at")
+            schedules = self._database["monitoring_schedules"]
+            await schedules.create_index(
+                [("organization_id", ASCENDING), ("competitor_id", ASCENDING)],
+                unique=True,
+            )
+            await schedules.create_index(
+                [
+                    ("is_enabled", ASCENDING),
+                    ("next_run_at", ASCENDING),
+                    ("scheduler_lease_expires_at", ASCENDING),
+                ]
+            )
+            notifications = self._database["notifications"]
+            await notifications.create_index(
+                [("organization_id", ASCENDING), ("created_at", DESCENDING)]
+            )
+            await notifications.create_index(
+                [("organization_id", ASCENDING), ("is_read", ASCENDING), ("created_at", DESCENDING)]
+            )
+            await notifications.create_index(
+                [("organization_id", ASCENDING), ("deduplication_key", ASCENDING)],
+                unique=True,
+            )
+            await notifications.create_index("expires_at", expireAfterSeconds=0)
+            service_instances = self._database["service_instances"]
+            await service_instances.create_index(
+                [("service_type", ASCENDING), ("heartbeat_at", DESCENDING)]
             )
         except PyMongoError as exc:
             raise RepositoryUnavailableError from exc

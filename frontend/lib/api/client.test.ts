@@ -132,6 +132,132 @@ test("scan writes include an idempotency key", async () => {
   }
 });
 
+test("monitoring schedule writes are organization scoped without tenant fields", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined; body: string }> = [];
+  globalThis.fetch = async (input, init) => {
+    requests.push({
+      url: String(input),
+      method: init?.method,
+      body: String(init?.body ?? ""),
+    });
+    return Response.json({
+      id: "schedule-1",
+      competitor_id: "competitor/1",
+      cadence: "daily",
+      timezone: "UTC",
+      is_enabled: true,
+    });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.getMonitoringSchedule("competitor/1");
+    await api.updateMonitoringSchedule("competitor/1", {
+      cadence: "daily",
+      is_enabled: true,
+    });
+
+    assert.deepEqual(
+      requests.map((request) => [request.url, request.method]),
+      [
+        [
+          "http://api.test/api/v1/competitors/competitor%2F1/monitoring-schedule",
+          undefined,
+        ],
+        [
+          "http://api.test/api/v1/competitors/competitor%2F1/monitoring-schedule",
+          "PATCH",
+        ],
+      ],
+    );
+    const body = JSON.parse(requests[1].body) as Record<string, unknown>;
+    assert.deepEqual(body, {
+      timezone: "UTC",
+      cadence: "daily",
+      is_enabled: true,
+    });
+    assert.equal("organization_id" in body, false);
+    assert.equal("company_profile_id" in body, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("run-now queues a durable competitor scan", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    capturedUrl = String(input);
+    captured = init;
+    return Response.json(
+      { scan: { id: "scan-1" }, job: { id: "job-1", status: "queued" } },
+      { status: 202 },
+    );
+  };
+  try {
+    const api = client(async () => "organization-token");
+    const response = await api.runMonitoringNow("competitor/1");
+    assert.equal(response.job?.id, "job-1");
+    assert.equal(
+      capturedUrl,
+      "http://api.test/api/v1/competitors/competitor%2F1/monitoring-schedule/run-now",
+    );
+    assert.equal(captured?.method, "POST");
+    assert.equal(
+      new Headers(captured?.headers).get("Authorization"),
+      "Bearer organization-token",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("notification reads and mutations use encoded organization-scoped routes", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string | undefined }> = [];
+  globalThis.fetch = async (input, init) => {
+    requests.push({ url: String(input), method: init?.method });
+    if (String(input).endsWith("/unread-count")) {
+      return Response.json({ unread_count: 2 });
+    }
+    if (String(input).endsWith("/read-all")) {
+      return Response.json({ unread_count: 0 });
+    }
+    if (String(input).endsWith("/read")) {
+      return Response.json({ id: "notification/1", is_read: true });
+    }
+    return Response.json({ items: [], next_cursor: null });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.listNotifications(undefined, { unreadOnly: true, limit: 20 });
+    await api.getNotificationUnreadCount();
+    await api.markNotificationRead("notification/1");
+    await api.markAllNotificationsRead();
+    assert.deepEqual(requests, [
+      {
+        url: "http://api.test/api/v1/notifications?unread_only=true&limit=20",
+        method: undefined,
+      },
+      {
+        url: "http://api.test/api/v1/notifications/unread-count",
+        method: undefined,
+      },
+      {
+        url: "http://api.test/api/v1/notifications/notification%2F1/read",
+        method: "POST",
+      },
+      {
+        url: "http://api.test/api/v1/notifications/read-all",
+        method: "POST",
+      },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("company reinitialization uses an organization-scoped idempotent write", async () => {
   const originalFetch = globalThis.fetch;
   let capturedUrl = "";
@@ -351,6 +477,111 @@ test("cancelled cross-origin upload reports cancellation without leaking a token
         error.code === "REQUEST_CANCELLED",
     );
     assert.equal(capturedAuthorization, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("intelligence search serializes only supported organization-scoped filters", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    capturedUrl = String(input);
+    captured = init;
+    return Response.json({
+      query: "pricing",
+      bundle: {
+        items: [],
+        grouped_by_competitor: {},
+        coverage: {
+          competitor_count: 0,
+          source_type_count: 0,
+          category_count: 0,
+          earliest_observed_at: null,
+          latest_observed_at: null,
+        },
+        warnings: [],
+      },
+    });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.searchIntelligence({
+      query: "pricing",
+      competitor_ids: ["competitor-1"],
+      categories: ["pricing"],
+    });
+    assert.equal(capturedUrl, "http://api.test/api/v1/intelligence/search");
+    assert.deepEqual(JSON.parse(String(captured?.body)), {
+      query: "pricing",
+      competitor_ids: ["competitor-1"],
+      categories: ["pricing"],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("intelligence search forwards cancellation as a cancelled API error", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new DOMException("Aborted", "AbortError");
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await assert.rejects(
+      () => api.searchIntelligence({ query: "pricing" }, new AbortController().signal),
+      (error: unknown) => error instanceof ApiError && error.kind === "cancelled",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reindex queues one durable workspace job without tenant fields", async () => {
+  const originalFetch = globalThis.fetch;
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (_input, init) => {
+    captured = init;
+    return Response.json({ job_id: "job-1", status: "queued" }, { status: 202 });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.reindexIntelligence(["competitor-1"]);
+    assert.deepEqual(JSON.parse(String(captured?.body)), {
+      competitor_ids: ["competitor-1"],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("competitor timeline pagination remains bounded and organization authenticated", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    capturedUrl = String(input);
+    captured = init;
+    return Response.json({ items: [], next_cursor: null });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.getCompetitorTimeline("competitor/1", {
+      cursor: "evidence/10",
+      limit: 10,
+    });
+    assert.equal(
+      capturedUrl,
+      "http://api.test/api/v1/competitors/competitor%2F1/timeline?cursor=evidence%2F10&limit=10",
+    );
+    assert.equal(
+      new Headers(captured?.headers).get("Authorization"),
+      "Bearer organization-token",
+    );
+    assert.equal(capturedUrl.includes("organization_id"), false);
+    assert.equal(capturedUrl.includes("namespace"), false);
   } finally {
     globalThis.fetch = originalFetch;
   }

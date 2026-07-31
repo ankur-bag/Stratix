@@ -8,11 +8,22 @@ import type {
   CompetitorSourceCreate,
   CompetitorSourcePage,
   CompetitorSourceUpdate,
+  CompetitorTimelinePage,
   CompanyDocument,
   DocumentIngestionJob,
   DocumentUploadResponse,
+  MonitoringCadence,
+  MonitoringSchedule,
+  Notification,
+  NotificationPage,
   ReinitializeResponse,
   SignalPage,
+  IntelligenceAnswerResponse,
+  IntelligenceIndexingStatus,
+  IntelligenceOverview,
+  IntelligenceReindexResponse,
+  IntelligenceSearchInput,
+  IntelligenceSearchResponse,
 } from "./types";
 
 export type ApiErrorEnvelope = {
@@ -353,6 +364,121 @@ export class ApiClient {
   deleteCompanyDocument(documentId: string): Promise<void> {
     return this.request(`/api/v1/company-documents/${encodeURIComponent(documentId)}`, {
       method: "DELETE",
+    });
+  }
+
+  getMonitoringSchedule(
+    competitorId: string,
+    signal?: AbortSignal,
+  ): Promise<MonitoringSchedule> {
+    return this.request(
+      `/api/v1/competitors/${encodeURIComponent(competitorId)}/monitoring-schedule`,
+      { signal },
+    );
+  }
+
+  updateMonitoringSchedule(
+    competitorId: string,
+    input: {
+      is_enabled: boolean;
+      cadence: MonitoringCadence;
+      timezone?: string;
+    },
+  ): Promise<MonitoringSchedule> {
+    return this.request(
+      `/api/v1/competitors/${encodeURIComponent(competitorId)}/monitoring-schedule`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ timezone: "UTC", ...input }),
+      },
+    );
+  }
+
+  runMonitoringNow(competitorId: string): Promise<CompetitorScanResponse> {
+    return this.request(
+      `/api/v1/competitors/${encodeURIComponent(competitorId)}/monitoring-schedule/run-now`,
+      { method: "POST" },
+    );
+  }
+
+  listNotifications(
+    signal?: AbortSignal,
+    options: { unreadOnly?: boolean; cursor?: string; limit?: number } = {},
+  ): Promise<NotificationPage> {
+    const params = new URLSearchParams();
+    if (options.unreadOnly) params.set("unread_only", "true");
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit) params.set("limit", String(options.limit));
+    const query = params.size ? `?${params.toString()}` : "";
+    return this.request(`/api/v1/notifications${query}`, { signal });
+  }
+
+  getNotificationUnreadCount(signal?: AbortSignal): Promise<{ unread_count: number }> {
+    return this.request("/api/v1/notifications/unread-count", { signal });
+  }
+
+  markNotificationRead(notificationId: string): Promise<Notification> {
+    return this.request(
+      `/api/v1/notifications/${encodeURIComponent(notificationId)}/read`,
+      { method: "POST" },
+    );
+  }
+
+  markAllNotificationsRead(): Promise<{ unread_count: number }> {
+    return this.request("/api/v1/notifications/read-all", { method: "POST" });
+  }
+
+  searchIntelligence(
+    input: IntelligenceSearchInput,
+    signal?: AbortSignal,
+  ): Promise<IntelligenceSearchResponse> {
+    return this.request("/api/v1/intelligence/search", {
+      method: "POST",
+      body: JSON.stringify(input),
+      signal,
+    });
+  }
+
+  answerIntelligence(
+    input: IntelligenceSearchInput,
+    signal?: AbortSignal,
+  ): Promise<IntelligenceAnswerResponse> {
+    return this.request("/api/v1/intelligence/answer", {
+      method: "POST",
+      body: JSON.stringify(input),
+      signal,
+    });
+  }
+
+  getIntelligenceOverview(signal?: AbortSignal): Promise<IntelligenceOverview> {
+    return this.request("/api/v1/intelligence/overview", { signal });
+  }
+
+  getCompetitorTimeline(
+    competitorId: string,
+    options: { cursor?: string; limit?: number } = {},
+    signal?: AbortSignal,
+  ): Promise<CompetitorTimelinePage> {
+    const params = new URLSearchParams();
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit) params.set("limit", String(options.limit));
+    const query = params.size ? `?${params.toString()}` : "";
+    return this.request(
+      `/api/v1/competitors/${encodeURIComponent(competitorId)}/timeline${query}`,
+      { signal },
+    );
+  }
+
+  getIntelligenceIndexingStatus(
+    signal?: AbortSignal,
+  ): Promise<IntelligenceIndexingStatus> {
+    return this.request("/api/v1/intelligence/indexing-status", { signal });
+  }
+
+  reindexIntelligence(competitorIds: string[] = []): Promise<IntelligenceReindexResponse> {
+    return this.request("/api/v1/intelligence/reindex", {
+      method: "POST",
+      body: JSON.stringify({ competitor_ids: competitorIds }),
     });
   }
 

@@ -28,7 +28,7 @@ class DiscoveryStarter(Protocol):
 class BackgroundExecutor(Protocol):
     """Replaceable boundary for scheduling persisted initialization jobs."""
 
-    def schedule(self, *, job_id: str, organization_id: str) -> None: ...
+    async def schedule(self, *, job_id: str, organization_id: str) -> None: ...
     async def close(self) -> None: ...
 
 
@@ -267,7 +267,7 @@ class InProcessBackgroundExecutor:
         self._runner = runner
         self._tasks: set[asyncio.Task[None]] = set()
 
-    def schedule(self, *, job_id: str, organization_id: str) -> None:
+    async def schedule(self, *, job_id: str, organization_id: str) -> None:
         task = asyncio.create_task(self._runner.run(job_id=job_id, organization_id=organization_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)

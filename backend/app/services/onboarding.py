@@ -60,10 +60,12 @@ class CompanyOnboardingService:
         persistence: Persistence,
         background_executor: BackgroundExecutor,
         document_service: OnboardingDocumentService | None = None,
+        rebuild_executor: BackgroundExecutor | None = None,
     ) -> None:
         self._persistence = persistence
         self._background_executor = background_executor
         self._document_service = document_service
+        self._rebuild_executor = rebuild_executor or background_executor
 
     async def submit(
         self,
@@ -295,7 +297,9 @@ class CompanyOnboardingService:
             ) from exc
         except RepositoryUnavailableError as exc:
             raise self._database_unavailable_error() from exc
-        self._background_executor.schedule(job_id=job.id, organization_id=context.organization_id)
+        await self._rebuild_executor.schedule(
+            job_id=job.id, organization_id=context.organization_id
+        )
         return self._reinitialize_response(job)
 
     async def _create_submission(
@@ -379,7 +383,9 @@ class CompanyOnboardingService:
             else:
                 await self._persistence.company_profiles.delete(context.organization_id, company.id)
             raise
-        self._background_executor.schedule(job_id=job.id, organization_id=context.organization_id)
+        await self._background_executor.schedule(
+            job_id=job.id, organization_id=context.organization_id
+        )
         return self._response(company, job)
 
     async def _compensate(

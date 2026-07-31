@@ -9,6 +9,7 @@ from app.api.errors import AppError
 from app.core.auth import AuthenticatedContext
 from app.core.config import Settings
 from app.core.logging import get_logger
+from app.domain.background_jobs import JobType
 from app.domain.documents import (
     CompanyDocument,
     CompanyKnowledgeChunk,
@@ -26,6 +27,7 @@ from app.domain.documents import (
 )
 from app.domain.onboarding import new_id, utc_now
 from app.repositories.interfaces import Persistence, RepositoryUnavailableError
+from app.services.background_jobs import BackgroundJobQueue
 from app.services.document_storage import (
     ObjectStorage,
     StorageSizeExceededError,
@@ -63,6 +65,7 @@ class DocumentIngestionRunner:
         embeddings: EmbeddingProvider,
         vectors: VectorStore,
         settings: Settings,
+        cleanup_queue: BackgroundJobQueue | None = None,
     ) -> None:
         self._persistence = persistence
         self._storage = storage
@@ -71,6 +74,7 @@ class DocumentIngestionRunner:
         self._embeddings = embeddings
         self._vectors = vectors
         self._settings = settings
+        self._cleanup_queue = cleanup_queue
         self._semaphore = asyncio.Semaphore(settings.document_ingestion_max_concurrency)
 
     async def run(self, *, job_id: str, organization_id: str) -> None:
@@ -282,6 +286,32 @@ class DocumentIngestionRunner:
     async def _delete_old_vectors(self, document: CompanyDocument, active_version: int) -> None:
         if not self._vectors.enabled or document.active_version is None:
             return
+        if self._settings.background_jobs_enabled and self._cleanup_queue is not None:
+            try:
+                await self._cleanup_queue.enqueue(
+                    organization_id=document.organization_id,
+                    company_profile_id=document.company_profile_id,
+                    job_type=JobType.PINECONE_CLEANUP,
+                    domain_resource_type="company_document",
+                    domain_resource_id=document.id,
+                    deduplication_key=(f"stale-vectors:{document.id}:{document.active_version}"),
+                    payload={
+                        "cleanup_scope": "stale_version",
+                        "document_version": document.active_version,
+                    },
+                    created_by_user_id=document.uploaded_by_user_id,
+                    enforce_backpressure=False,
+                    deduplicate_terminal=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "stale_vector_cleanup_enqueue_failed",
+                    organization_id=document.organization_id,
+                    document_id=document.id,
+                    document_version=document.active_version,
+                    exception_type=type(exc).__name__,
+                )
+            return
         old = await self._persistence.company_knowledge_chunks.list_for_document_version(
             document.organization_id, document.id, document.active_version
         )
@@ -374,6 +404,7 @@ class CompanyDocumentService:
         embeddings: EmbeddingProvider,
         vectors: VectorStore,
         settings: Settings,
+        cleanup_queue: BackgroundJobQueue | None = None,
     ) -> None:
         self._persistence = persistence
         self._storage = storage
@@ -381,6 +412,7 @@ class CompanyDocumentService:
         self._embeddings = embeddings
         self._vectors = vectors
         self._settings = settings
+        self._cleanup_queue = cleanup_queue
 
     async def request_upload(
         self, context: AuthenticatedContext, request: UploadRequest
@@ -672,6 +704,26 @@ class CompanyDocumentService:
                 "deleted_at": now,
             },
         )
+        if (
+            self._settings.background_jobs_enabled
+            and self._settings.app_env != "testing"
+            and self._cleanup_queue is not None
+        ):
+            for job_type in (
+                JobType.PINECONE_CLEANUP,
+                JobType.DOCUMENT_STORAGE_CLEANUP,
+            ):
+                await self._cleanup_queue.enqueue(
+                    organization_id=context.organization_id,
+                    company_profile_id=document.company_profile_id,
+                    job_type=job_type,
+                    domain_resource_type="company_document",
+                    domain_resource_id=document.id,
+                    deduplication_key=f"{job_type.value}:{document.id}",
+                    created_by_user_id=context.user_id,
+                    enforce_backpressure=False,
+                )
+            return
         if self._vectors.enabled:
             try:
                 await self._vectors.delete(
@@ -841,7 +893,7 @@ class CompanyDocumentService:
                 "error_message": None,
             },
         )
-        self._executor.schedule(job_id=job.id, organization_id=context.organization_id)
+        await self._executor.schedule(job_id=job.id, organization_id=context.organization_id)
         return job
 
     async def _get(self, organization_id: str, document_id: str) -> CompanyDocument:

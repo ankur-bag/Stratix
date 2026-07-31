@@ -43,7 +43,13 @@ def application(
     discovery_background_executor: RecordingBackgroundExecutor,
     competitor_scan_executor: RecordingCompetitorScanExecutor,
 ) -> FastAPI:
-    settings = Settings(app_env="testing", app_debug=False, _env_file=None)
+    settings = Settings(
+        app_env="testing",
+        app_debug=False,
+        background_jobs_enabled=False,
+        scheduler_enabled=False,
+        _env_file=None,
+    )
     app = create_app(
         settings,
         persistence=persistence,

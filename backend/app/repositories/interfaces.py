@@ -1,7 +1,19 @@
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
+from app.domain.background_jobs import (
+    BackgroundJob,
+    BackgroundJobStatus,
+    JobType,
+    MonitoringSchedule,
+    NewBackgroundJob,
+    Notification,
+    NotificationSeverity,
+    NotificationType,
+    ServiceInstance,
+    ServiceType,
+)
 from app.domain.discovery import (
     CandidateStatus,
     Competitor,
@@ -18,6 +30,12 @@ from app.domain.documents import (
     DocumentStage,
 )
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
+from app.domain.intelligence_evidence import (
+    EvidenceSourceKind,
+    EvidenceSourceType,
+    IntelligenceCategory,
+    IntelligenceEvidence,
+)
 from app.domain.monitoring import CompetitorSource, SourceStatus
 from app.domain.onboarding import (
     CompanyProfile,
@@ -39,8 +57,175 @@ class RepositoryUnavailableError(Exception):
     """The persistence provider could not complete an operation."""
 
 
+class BackgroundJobRepository(Protocol):
+    async def enqueue(self, *, job: NewBackgroundJob) -> BackgroundJob: ...
+    async def get_by_id(self, organization_id: str, job_id: str) -> BackgroundJob | None: ...
+    async def get_active_by_deduplication_key(
+        self, organization_id: str, deduplication_key: str
+    ) -> BackgroundJob | None: ...
+    async def get_by_deduplication_key(
+        self, organization_id: str, deduplication_key: str
+    ) -> BackgroundJob | None: ...
+    async def claim_next(
+        self,
+        *,
+        worker_id: str,
+        supported_job_types: set[JobType],
+        now: datetime,
+        lease_duration: timedelta,
+        excluded_organization_id: str | None = None,
+    ) -> BackgroundJob | None: ...
+    async def renew_lease(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        now: datetime,
+        lease_duration: timedelta,
+    ) -> bool: ...
+    async def mark_running(
+        self, *, job_id: str, worker_id: str, now: datetime
+    ) -> BackgroundJob | None: ...
+    async def update_progress(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        now: datetime,
+        progress_percent: int,
+        stage: str,
+        message: str,
+    ) -> BackgroundJob | None: ...
+    async def mark_succeeded(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        now: datetime,
+        status: BackgroundJobStatus,
+        stage: str,
+        message: str,
+        result_summary: Mapping[str, Any],
+    ) -> BackgroundJob | None: ...
+    async def schedule_retry(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        now: datetime,
+        available_at: datetime,
+        error_code: str,
+        error_message: str,
+        error_class: str,
+    ) -> BackgroundJob | None: ...
+    async def mark_failed(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        now: datetime,
+        error_code: str,
+        error_message: str,
+        error_class: str,
+    ) -> BackgroundJob | None: ...
+    async def mark_dead_lettered(
+        self,
+        *,
+        job_id: str,
+        worker_id: str | None,
+        now: datetime,
+        error_code: str,
+        error_message: str,
+        error_class: str,
+    ) -> BackgroundJob | None: ...
+    async def request_cancellation(
+        self, organization_id: str, job_id: str, now: datetime
+    ) -> BackgroundJob | None: ...
+    async def mark_cancelled(
+        self, *, job_id: str, worker_id: str | None, now: datetime
+    ) -> BackgroundJob | None: ...
+    async def recover_expired_leases(self, *, now: datetime, limit: int) -> list[BackgroundJob]: ...
+    async def list(
+        self,
+        organization_id: str,
+        *,
+        status: BackgroundJobStatus | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[BackgroundJob]: ...
+    async def count_active_for_organization(self, organization_id: str) -> int: ...
+    async def count_queued(
+        self, *, organization_id: str | None = None, scan_only: bool = False
+    ) -> int: ...
+    async def operational_counts(self, now: datetime) -> tuple[int | None, int, int]: ...
+    async def cleanup_terminal(
+        self,
+        organization_id: str,
+        *,
+        succeeded_before: datetime,
+        failed_before: datetime,
+        limit: int,
+    ) -> int: ...
+
+
+class MonitoringScheduleRepository(Protocol):
+    async def create(self, schedule: MonitoringSchedule) -> MonitoringSchedule: ...
+    async def get_for_competitor(
+        self, organization_id: str, competitor_id: str
+    ) -> MonitoringSchedule | None: ...
+    async def update(
+        self, organization_id: str, schedule_id: str, changes: Mapping[str, Any]
+    ) -> MonitoringSchedule | None: ...
+    async def reserve_due(
+        self,
+        *,
+        scheduler_id: str,
+        now: datetime,
+        lease_duration: timedelta,
+    ) -> MonitoringSchedule | None: ...
+    async def release_reservation(
+        self,
+        *,
+        schedule_id: str,
+        scheduler_id: str,
+        now: datetime,
+        next_run_at: datetime | None,
+        job_id: str | None,
+        degraded_reason: str | None = None,
+    ) -> MonitoringSchedule | None: ...
+
+
+class NotificationRepository(Protocol):
+    async def create(self, notification: Notification) -> Notification: ...
+    async def list(
+        self,
+        organization_id: str,
+        *,
+        unread_only: bool,
+        severity: NotificationSeverity | None,
+        notification_type: NotificationType | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[Notification]: ...
+    async def unread_count(self, organization_id: str) -> int: ...
+    async def mark_read(
+        self, organization_id: str, notification_id: str, now: datetime
+    ) -> Notification | None: ...
+    async def mark_all_read(self, organization_id: str, now: datetime) -> int: ...
+    async def cleanup_expired(
+        self, organization_id: str, *, before: datetime, limit: int
+    ) -> int: ...
+
+
+class ServiceInstanceRepository(Protocol):
+    async def heartbeat(self, instance: ServiceInstance) -> ServiceInstance: ...
+    async def has_fresh(self, service_type: ServiceType, threshold: datetime) -> bool: ...
+    async def cleanup_expired(self, *, before: datetime, limit: int) -> int: ...
+
+
 class CompanyProfileRepository(Protocol):
     async def create(self, profile: CompanyProfile) -> CompanyProfile: ...
+    async def list_organization_ids(self, *, limit: int) -> list[str]: ...
     async def get_for_organization(self, organization_id: str) -> CompanyProfile | None: ...
     async def get_by_id(
         self, organization_id: str, company_profile_id: str
@@ -102,6 +287,9 @@ class InitializationJobRepository(Protocol):
         error_code: str,
         error_message: str,
     ) -> InitializationJob | None: ...
+    async def reset_for_retry(
+        self, organization_id: str, job_id: str, message: str
+    ) -> InitializationJob | None: ...
     async def delete(self, organization_id: str, job_id: str) -> None: ...
 
 
@@ -143,6 +331,9 @@ class CompanyDocumentRepository(Protocol):
     async def update(
         self, organization_id: str, document_id: str, changes: Mapping[str, Any]
     ) -> CompanyDocument | None: ...
+    async def list_expired_pending(
+        self, organization_id: str, *, before: datetime, limit: int
+    ) -> list[CompanyDocument]: ...
 
 
 class DocumentIngestionJobRepository(Protocol):
@@ -166,6 +357,9 @@ class DocumentIngestionJobRepository(Protocol):
         warning_codes: list[str] | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+    ) -> DocumentIngestionJob | None: ...
+    async def reset_for_retry(
+        self, organization_id: str, job_id: str, message: str
     ) -> DocumentIngestionJob | None: ...
 
 
@@ -344,6 +538,9 @@ class CompetitorScanRepository(Protocol):
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> CompetitorScanJob | None: ...
+    async def reset_for_retry(
+        self, organization_id: str, scan_id: str, message: str
+    ) -> CompetitorScanJob | None: ...
 
 
 class CompetitorSnapshotRepository(Protocol):
@@ -357,6 +554,17 @@ class CompetitorSnapshotRepository(Protocol):
     async def get_for_scan_source(
         self, organization_id: str, scan_id: str, source_id: str
     ) -> CompetitorSnapshot | None: ...
+    async def list_for_scan(
+        self, organization_id: str, scan_id: str, *, limit: int = 100
+    ) -> list[CompetitorSnapshot]: ...
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> list[CompetitorSnapshot]: ...
 
 
 class CompetitorSignalRepository(Protocol):
@@ -382,7 +590,69 @@ class CompetitorSignalRepository(Protocol):
     ) -> CompetitorSignal | None: ...
 
 
+class IntelligenceEvidenceRepository(Protocol):
+    async def create_many(
+        self, evidence: list[IntelligenceEvidence]
+    ) -> list[IntelligenceEvidence]: ...
+    async def get_many(
+        self, organization_id: str, evidence_ids: list[str], *, active_only: bool = True
+    ) -> list[IntelligenceEvidence]: ...
+    async def list_for_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> list[IntelligenceEvidence]: ...
+    async def list_for_source(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        *,
+        active_only: bool = False,
+    ) -> list[IntelligenceEvidence]: ...
+    async def activate_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> None: ...
+    async def delete_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> None: ...
+    async def deactivate_source(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+    ) -> list[str]: ...
+    async def list_active(
+        self,
+        organization_id: str,
+        *,
+        competitor_id: str | None = None,
+        competitor_ids: list[str] | None = None,
+        categories: list[IntelligenceCategory] | None = None,
+        source_types: list[EvidenceSourceType] | None = None,
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> list[IntelligenceEvidence]: ...
+    async def count_status(self, organization_id: str) -> tuple[int, int, datetime | None]: ...
+
+
 class Persistence(Protocol):
+    background_jobs: BackgroundJobRepository
+    monitoring_schedules: MonitoringScheduleRepository
+    notifications: NotificationRepository
+    service_instances: ServiceInstanceRepository
     company_profiles: CompanyProfileRepository
     sources: SourceRepository
     initialization_jobs: InitializationJobRepository
@@ -399,6 +669,7 @@ class Persistence(Protocol):
     competitor_scans: CompetitorScanRepository
     competitor_snapshots: CompetitorSnapshotRepository
     competitor_signals: CompetitorSignalRepository
+    intelligence_evidence: IntelligenceEvidenceRepository
 
     async def start(self) -> None: ...
     async def ping(self) -> bool: ...

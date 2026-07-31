@@ -118,6 +118,63 @@ class Settings(BaseSettings):
     pinecone_default_top_k: int = 8
     pinecone_max_top_k: int = 30
     pinecone_query_overfetch_factor: int = 3
+    competitor_evidence_indexing_enabled: bool = True
+    competitor_evidence_indexing_required: bool = False
+    competitor_snapshot_chunk_target_characters: int = 3000
+    competitor_snapshot_chunk_max_characters: int = 5000
+    competitor_snapshot_chunk_overlap_characters: int = 400
+    competitor_snapshot_chunk_min_characters: int = 150
+    competitor_evidence_database_batch_size: int = 100
+    competitor_evidence_embedding_batch_size: int = 32
+    competitor_evidence_vector_batch_size: int = 100
+    competitor_evidence_max_concurrency: int = 2
+    intelligence_search_default_limit: int = 10
+    intelligence_search_max_limit: int = 40
+    intelligence_search_query_max_characters: int = 2000
+    intelligence_search_overfetch_factor: int = 3
+    intelligence_default_lookback_days: int = 180
+    intelligence_max_lookback_days: int = 1095
+    intelligence_max_competitors_per_query: int = 20
+    intelligence_max_evidence_bundle_items: int = 30
+    intelligence_structured_synthesis_enabled: bool = False
+    background_jobs_enabled: bool = True
+    embedded_worker_enabled: bool = False
+    worker_id_prefix: str = "stratix-worker"
+    worker_poll_interval_seconds: float = 2
+    worker_idle_backoff_max_seconds: float = 10
+    worker_max_concurrency: int = 4
+    worker_graceful_shutdown_seconds: float = 30
+    job_lease_duration_seconds: int = 120
+    job_heartbeat_interval_seconds: int = 30
+    job_max_attempts_default: int = 4
+    job_retry_base_seconds: float = 5
+    job_retry_max_seconds: float = 900
+    job_retry_jitter_ratio: float = 0.2
+    job_progress_update_min_interval_seconds: float = 2
+    job_progress_update_min_percent_delta: int = 2
+    job_recovery_batch_size: int = 100
+    scheduler_enabled: bool = True
+    embedded_scheduler_enabled: bool = False
+    scheduler_poll_interval_seconds: float = 30
+    scheduler_lease_duration_seconds: int = 120
+    scheduler_heartbeat_interval_seconds: int = 30
+    monitoring_default_cadence: Literal["manual", "daily", "every_3_days", "weekly"] = "weekly"
+    monitoring_min_interval_hours: int = 24
+    max_running_jobs_per_organization: int = 2
+    max_active_jobs_per_organization: int = 50
+    max_queued_scans_per_organization: int = 20
+    max_global_queued_jobs: int = 10_000
+    company_initialization_max_concurrency: int = 1
+    competitor_scan_max_concurrency: int = 2
+    cleanup_job_max_concurrency: int = 1
+    max_running_scans_per_competitor: int = 1
+    job_cleanup_retention_days: int = 30
+    dead_letter_retention_days: int = 90
+    notification_retention_days: int = 90
+    require_active_worker: bool = False
+    require_active_scheduler: bool = False
+    worker_heartbeat_ttl_seconds: int = 120
+    scheduler_heartbeat_ttl_seconds: int = 120
 
     @model_validator(mode="after")
     def reject_insecure_production_auth(self) -> "Settings":
@@ -304,6 +361,21 @@ class Settings(BaseSettings):
             self.pinecone_default_top_k,
             self.pinecone_max_top_k,
             self.pinecone_query_overfetch_factor,
+            self.competitor_snapshot_chunk_target_characters,
+            self.competitor_snapshot_chunk_max_characters,
+            self.competitor_snapshot_chunk_min_characters,
+            self.competitor_evidence_database_batch_size,
+            self.competitor_evidence_embedding_batch_size,
+            self.competitor_evidence_vector_batch_size,
+            self.competitor_evidence_max_concurrency,
+            self.intelligence_search_default_limit,
+            self.intelligence_search_max_limit,
+            self.intelligence_search_query_max_characters,
+            self.intelligence_search_overfetch_factor,
+            self.intelligence_default_lookback_days,
+            self.intelligence_max_lookback_days,
+            self.intelligence_max_competitors_per_query,
+            self.intelligence_max_evidence_bundle_items,
         )
         if any(value <= 0 for value in positive_values):
             raise ValueError("Document intelligence limits must be positive")
@@ -319,6 +391,27 @@ class Settings(BaseSettings):
             raise ValueError("Embedding and Pinecone dimensions must match")
         if self.pinecone_default_top_k > self.pinecone_max_top_k:
             raise ValueError("Default vector top-k cannot exceed the maximum")
+        if (
+            self.competitor_snapshot_chunk_target_characters
+            > self.competitor_snapshot_chunk_max_characters
+        ):
+            raise ValueError("Competitor snapshot chunk target cannot exceed the maximum")
+        if (
+            not 0
+            <= self.competitor_snapshot_chunk_overlap_characters
+            < (self.competitor_snapshot_chunk_target_characters)
+        ):
+            raise ValueError("Competitor snapshot chunk overlap must be smaller than the target")
+        if self.intelligence_search_default_limit > self.intelligence_search_max_limit:
+            raise ValueError("Intelligence default search limit cannot exceed the maximum")
+        if self.intelligence_default_lookback_days > self.intelligence_max_lookback_days:
+            raise ValueError("Intelligence default lookback cannot exceed the maximum")
+        if self.competitor_evidence_indexing_required and not (
+            self.competitor_evidence_indexing_enabled
+            and self.embeddings_enabled
+            and self.vector_search_enabled
+        ):
+            raise ValueError("Required competitor evidence indexing is not fully configured")
         if self.embeddings_enabled and not self.gemini_api_key:
             raise ValueError("GEMINI_API_KEY is required when embeddings are enabled")
         if (
@@ -337,6 +430,57 @@ class Settings(BaseSettings):
             raise ValueError("Required vector search cannot use the disabled provider")
         if self.document_storage_provider == "s3" and not self.document_s3_bucket:
             raise ValueError("DOCUMENT_S3_BUCKET is required for S3 document storage")
+        return self
+
+    @model_validator(mode="after")
+    def validate_background_job_configuration(self) -> "Settings":
+        positive = (
+            self.worker_poll_interval_seconds,
+            self.worker_idle_backoff_max_seconds,
+            self.worker_max_concurrency,
+            self.worker_graceful_shutdown_seconds,
+            self.job_lease_duration_seconds,
+            self.job_heartbeat_interval_seconds,
+            self.job_max_attempts_default,
+            self.job_retry_base_seconds,
+            self.job_retry_max_seconds,
+            self.job_progress_update_min_interval_seconds,
+            self.job_progress_update_min_percent_delta,
+            self.job_recovery_batch_size,
+            self.scheduler_poll_interval_seconds,
+            self.scheduler_lease_duration_seconds,
+            self.scheduler_heartbeat_interval_seconds,
+            self.monitoring_min_interval_hours,
+            self.max_running_jobs_per_organization,
+            self.max_active_jobs_per_organization,
+            self.max_queued_scans_per_organization,
+            self.max_global_queued_jobs,
+            self.company_initialization_max_concurrency,
+            self.competitor_scan_max_concurrency,
+            self.cleanup_job_max_concurrency,
+            self.max_running_scans_per_competitor,
+            self.job_cleanup_retention_days,
+            self.dead_letter_retention_days,
+            self.notification_retention_days,
+            self.worker_heartbeat_ttl_seconds,
+            self.scheduler_heartbeat_ttl_seconds,
+        )
+        if any(value <= 0 for value in positive):
+            raise ValueError("Durable job and scheduler limits must be positive")
+        if self.job_heartbeat_interval_seconds >= self.job_lease_duration_seconds:
+            raise ValueError("JOB_HEARTBEAT_INTERVAL_SECONDS must be less than the lease")
+        if self.scheduler_heartbeat_interval_seconds >= self.scheduler_lease_duration_seconds:
+            raise ValueError("SCHEDULER_HEARTBEAT_INTERVAL_SECONDS must be less than the lease")
+        if self.job_retry_max_seconds < self.job_retry_base_seconds:
+            raise ValueError("JOB_RETRY_MAX_SECONDS must be at least JOB_RETRY_BASE_SECONDS")
+        if not 0 <= self.job_retry_jitter_ratio <= 1:
+            raise ValueError("JOB_RETRY_JITTER_RATIO must be between zero and one")
+        if self.worker_idle_backoff_max_seconds < self.worker_poll_interval_seconds:
+            raise ValueError("Worker idle backoff maximum must be at least the poll interval")
+        if self.app_env == "production" and self.embedded_worker_enabled:
+            raise ValueError("Production must run the worker as a separate process")
+        if self.app_env == "production" and self.embedded_scheduler_enabled:
+            raise ValueError("Production must run the scheduler as a separate process")
         return self
 
 

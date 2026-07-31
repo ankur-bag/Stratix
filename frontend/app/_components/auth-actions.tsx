@@ -6,11 +6,15 @@ import {
   SignUpButton,
   UserButton,
   useAuth,
+  useOrganization,
 } from "@clerk/nextjs";
 import Link from "next/link";
+import { NotificationCenter } from "@/app/_components/notification-center";
+import { organizationStateKey } from "@/lib/api/durable";
 
 export function HeaderAuthActions() {
   const { isLoaded, isSignedIn } = useAuth();
+  const { organization } = useOrganization();
 
   if (!isLoaded || isSignedIn === undefined) {
     return <div aria-hidden="true" className="h-9 w-24" />;
@@ -22,8 +26,14 @@ export function HeaderAuthActions() {
         <div className="hidden items-center gap-4 text-sm text-zinc-600 dark:text-zinc-400 md:flex">
           <Link className="transition hover:text-foreground" href="/dashboard">Dashboard</Link>
           <Link className="transition hover:text-foreground" href="/competitors">Competitors</Link>
+          <Link className="transition hover:text-foreground" href="/intelligence">Intelligence</Link>
           <Link className="transition hover:text-foreground" href="/settings">Settings</Link>
         </div>
+        {organization ? (
+          <NotificationCenter
+            key={organizationStateKey(organization.id, "notifications")}
+          />
+        ) : null}
         <OrganizationSwitcher
           afterSelectOrganizationUrl="/route-after-auth"
           createOrganizationMode="navigation"

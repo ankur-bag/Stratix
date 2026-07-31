@@ -5,6 +5,7 @@ from fastapi import status
 
 from app.api.errors import AppError
 from app.core.auth import AuthenticatedContext
+from app.domain.background_jobs import BackgroundJob
 from app.domain.discovery import BaselineStatus, CompetitorStatus, MonitoringStatus
 from app.domain.onboarding import new_id, utc_now
 from app.domain.scanning import (
@@ -27,7 +28,7 @@ class CompetitorScanRunner(Protocol):
 
 
 class CompetitorScanExecutor(Protocol):
-    def schedule(self, *, scan_id: str, organization_id: str) -> None: ...
+    async def schedule(self, *, scan_id: str, organization_id: str) -> BackgroundJob | None: ...
     async def close(self) -> None: ...
 
 
@@ -38,12 +39,13 @@ class InProcessCompetitorScanExecutor:
         self._runner = runner
         self._tasks: set[asyncio.Task[None]] = set()
 
-    def schedule(self, *, scan_id: str, organization_id: str) -> None:
+    async def schedule(self, *, scan_id: str, organization_id: str) -> BackgroundJob | None:
         task = asyncio.create_task(
             self._runner.run(scan_id=scan_id, organization_id=organization_id)
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return None
 
     async def close(self) -> None:
         for task in self._tasks:
@@ -178,7 +180,9 @@ class CompetitorScanService:
             },
         )
         try:
-            self._executor.schedule(scan_id=scan.id, organization_id=context.organization_id)
+            background_job = await self._executor.schedule(
+                scan_id=scan.id, organization_id=context.organization_id
+            )
         except Exception as exc:
             await self._persistence.competitor_scans.finalize(
                 context.organization_id,
@@ -200,7 +204,7 @@ class CompetitorScanService:
                 message="The competitor scan could not be scheduled.",
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             ) from exc
-        return CompetitorScanResponse(scan=scan)
+        return CompetitorScanResponse(scan=scan, job=background_job)
 
     async def start_auto(
         self, *, organization_id: str, competitor_id: str, requested_by_user_id: str

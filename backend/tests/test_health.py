@@ -19,7 +19,15 @@ def test_readiness(client: TestClient) -> None:
     response = client.get("/health/ready")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ready"}
+    assert response.json() == {
+        "status": "ready",
+        "intelligence": {
+            "indexing_enabled": True,
+            "indexing_required": False,
+            "embeddings_available": False,
+            "vector_store_available": False,
+        },
+    }
 
 
 def test_valid_correlation_id_is_echoed(client: TestClient) -> None:

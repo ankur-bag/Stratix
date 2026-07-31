@@ -3,6 +3,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from app.domain.background_jobs import BackgroundJob
 from app.domain.intelligence import NormalizedSection, PageType
 
 
@@ -75,6 +76,7 @@ class CompetitorScanRequest(BaseModel):
 
 class CompetitorScanResponse(BaseModel):
     scan: CompetitorScanJob
+    job: BackgroundJob | None = None
 
 
 class CompetitorScanPage(BaseModel):

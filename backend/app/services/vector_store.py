@@ -353,6 +353,17 @@ class FakeVectorStore:
                     return False
                 if "$in" in expected and metadata.get(key) not in expected["$in"]:
                     return False
+                if "$ne" in expected and metadata.get(key) == expected["$ne"]:
+                    return False
+                actual = metadata.get(key)
+                if "$gte" in expected and (actual is None or actual < expected["$gte"]):
+                    return False
+                if "$lte" in expected and (actual is None or actual > expected["$lte"]):
+                    return False
+                if "$gt" in expected and (actual is None or actual <= expected["$gt"]):
+                    return False
+                if "$lt" in expected and (actual is None or actual >= expected["$lt"]):
+                    return False
             elif metadata.get(key) != expected:
                 return False
         return True

@@ -262,7 +262,7 @@ Authenticated competitor monitoring:
 
 Signal listing supports `type`, `status`, `minimum_importance`, `source_id`, observation-date, `scan_id`, cursor, and bounded-limit filters. Signal PATCH accepts only `reviewed` or `dismissed`; evidence and facts are immutable through the API.
 
-Configure Phase 4 with the `AUTO_START_COMPETITOR_BASELINE`, `COMPETITOR_CRAWLER_*`, and `CHANGE_*` values documented in `.env.example`. Defaults collect one page per source, one request at a time per domain, and at most 12 sources. There is no cron scheduler, durable queue, anti-bot bypass, authenticated crawling, or continuous monitoring in this phase.
+Configure crawling with the `AUTO_START_COMPETITOR_BASELINE`, `COMPETITOR_CRAWLER_*`, and `CHANGE_*` values documented in `.env.example`. Defaults collect one page per source, one request at a time per domain, and at most 12 sources. Crawling still has no anti-bot bypass or authenticated-page support; Phase 5 adds durable execution and scheduled monitoring around the existing public-source workflow.
 
 Candidate listing supports `status`, `relationship_type`, `minimum_score`, `discovery_job_id`, `cursor`, and bounded `limit` filters. Cross-Organization resources appear not found.
 
@@ -285,3 +285,177 @@ git diff --check
 Tests use in-memory repositories and fake Clerk, crawler, search-provider, executor, and model boundaries. Multi-company tests exercise two Organizations owned by one user, Organization-scoped idempotency, profiles, jobs, competitors, sources, scans, and signals, including cross-Organization not-found behavior. They require no Clerk network access, Tavily, MongoDB, live websites, DNS, browser downloads, or model credentials.
 
 For a manual local smoke test, approve a candidate, open `/competitors/{competitor_id}`, confirm the initial website source, create the baseline, and wait for the terminal status. Run the same fake/static page again to verify the no-change outcome, then change a pricing or feature section and rescan to verify before/after evidence. Live crawling and production data changes must be authorized separately.
+
+## Durable jobs and scheduled monitoring
+
+Production API processes validate mutations, persist the user-facing domain record, enqueue a MongoDB-backed job, and return `202 Accepted`. FastAPI does not execute long-running initialization, competitor scans, PDF ingestion, rebuilds, or cleanup work directly in production. At least one separate worker process is required for queued work, and at least one scheduler process is required for automatic monitoring.
+
+`background_jobs` is the durable execution ledger. Each record is Organization-scoped and references its public domain record through `domain_resource_type` and `domain_resource_id`; the domain-specific initialization, scan, and ingestion endpoints remain the UI source of truth. Queue payloads contain only IDs and small versioned parameters—never PDF/page text, embeddings, credentials, or Clerk tokens.
+
+Workers atomically claim one eligible job with `find_one_and_update`, ordered by priority, availability, and creation time. A claim records the worker ID and a time-bounded lease. The owning worker renews that lease while the handler runs, and every progress/final-state mutation matches both job and worker. A result is discarded if ownership changes. Expired claims are recovered at worker startup and periodically: jobs with attempts remaining return to `retry_scheduled`; exhausted jobs become `dead_lettered`, and associated domain records are reconciled so they do not stay stuck in a running state.
+
+Retryable dependency failures use bounded exponential backoff with testable jitter and persist a future `available_at`; workers never sleep for the retry delay. Permanent validation/ownership/configuration failures fail immediately. Manual retry creates a new queue record and preserves the prior record as audit history. Queued cancellation is immediate; running cancellation becomes `cancel_requested` and is honored at safe handler checkpoints.
+
+Concurrency is layered across the worker, job type, Organization, and competitor. Active-job, queued-scan, and global-queue limits provide backpressure. The approximate-fair claim strategy avoids repeatedly selecting one Organization while another has runnable work. When scheduled work hits backpressure, the scheduler defers it for 15 minutes, records a safe degraded reason, and does not silently drop the occurrence.
+
+Monitoring schedules are stored in `monitoring_schedules`. New approved competitors default to the configured weekly cadence. Users can choose manual, daily, every three days, or weekly; the configured minimum interval prevents sub-daily scheduling. The scheduler atomically reserves due schedules and uses `schedule:{schedule_id}:{scheduled_timestamp}` as the occurrence key, so concurrent schedulers cannot enqueue the same occurrence twice. A manual/scheduled collision reuses the active competitor-level queue key instead of crawling twice.
+
+Final failed jobs and successful scans with new signals create deduplicated, Organization-scoped in-app notifications. Retry attempts and no-change scans do not create noise. `notifications` has bounded cursor reads, indexed unread counts, read-one/read-all mutations, and TTL plus durable-retention cleanup.
+
+Daily Organization-scoped `retention_cleanup` jobs expire abandoned uploads, enqueue canonical storage deletion, remove old successful/cancelled queue history after `JOB_CLEANUP_RETENTION_DAYS`, retain failed/dead-letter history for `DEAD_LETTER_RETENTION_DAYS`, remove old notifications, and prune expired service heartbeats in bounded batches. User-requested document deletion already enqueues separate idempotent Pinecone and object-storage cleanup jobs; handlers re-load the canonical Organization-owned document and derive the Pinecone namespace server-side.
+
+### MongoDB indexes
+
+Phase 5 adds queue indexes for claim order, expired leases, Organization/status and Organization/type/status queries, domain history, worker ownership, and completion time. Active `(organization_id, deduplication_key)` values use a partial unique index. Schedules have a unique Organization/competitor index plus a due/reservation index. Notifications have Organization/time, Organization/unread/time, Organization/deduplication, and expiry indexes. Service heartbeats are indexed by service type and freshness.
+
+### Processes
+
+Run these from `backend/` in separate terminals:
+
+```powershell
+# API
+uv run fastapi dev app/main.py
+
+# Durable worker
+uv run python -m app.worker
+
+# Monitoring scheduler
+uv run python -m app.scheduler
+```
+
+Keep `EMBEDDED_WORKER_ENABLED=false` and `EMBEDDED_SCHEDULER_ENABLED=false` in production. The API, worker, and scheduler share MongoDB and provider configuration, but are independently deployable processes. Enable `REQUIRE_ACTIVE_WORKER` or `REQUIRE_ACTIVE_SCHEDULER` only when readiness should fail without a fresh corresponding service heartbeat.
+
+Read-only diagnostics:
+
+```powershell
+uv run python scripts/check_workers.py status
+uv run python scripts/check_workers.py queue
+uv run python scripts/check_workers.py leases
+uv run python scripts/check_workers.py dead-letters
+uv run python scripts/benchmark_job_queue.py
+```
+
+`GET /health/ready` reports worker/scheduler availability, queue degradation, oldest queued age, expired leases, and dead-letter count without exposing hosts or secrets. With the `REQUIRE_ACTIVE_*` defaults set to false, a separately deployed service being temporarily absent is diagnostic rather than an API readiness failure.
+
+### Job and notification APIs
+
+- `GET /api/v1/jobs` and `GET /api/v1/jobs/{job_id}`
+- `POST /api/v1/jobs/{job_id}/cancel`
+- `POST /api/v1/jobs/{job_id}/retry`
+- `GET/PATCH /api/v1/competitors/{competitor_id}/monitoring-schedule`
+- `POST /api/v1/competitors/{competitor_id}/monitoring-schedule/run-now`
+- `GET /api/v1/notifications` and `GET /api/v1/notifications/unread-count`
+- `POST /api/v1/notifications/{notification_id}/read`
+- `POST /api/v1/notifications/read-all`
+
+All routes derive tenancy from the verified Clerk Organization. Organization IDs are never accepted in request bodies, and cross-Organization resources return not found.
+
+## Unified competitor intelligence evidence
+
+Phase 6 projects canonical competitor snapshots and objective signals into the
+`intelligence_evidence` MongoDB collection. Snapshot sections are normalized into
+deterministic, heading-aware chunks; signal projections retain bounded summaries and
+before/after evidence. MongoDB remains the source of truth. Pinecone stores only
+768-dimensional vectors and bounded identifiers/classifications in a namespace derived
+from the verified Clerk Organization.
+
+Indexing writes a new version inactive, embeds it, requires acknowledgement for every
+vector upsert, then activates the Mongo version and removes stale vectors. A failed
+projection leaves the prior active version searchable. Successful scans enqueue snapshot
+and signal indexing as optional durable follow-up work; indexing/provider failure cannot
+change an already successful scan result. Workspace reindexing reuses canonical stored
+sources and never recrawls websites or recreates signals.
+
+Intelligence APIs:
+
+- `POST /api/v1/intelligence/search`
+- `POST /api/v1/intelligence/answer`
+- `GET /api/v1/competitors/{competitor_id}/timeline`
+- `GET /api/v1/intelligence/overview`
+- `GET /api/v1/intelligence/trends`
+- `POST /api/v1/intelligence/reindex`
+- `GET /api/v1/intelligence/indexing-status`
+
+Search embeds the query, applies server-derived namespace and metadata filters, then
+re-fetches every match from MongoDB and revalidates tenancy, activity, deletion state,
+competitor filters, source filters, and date filters. Responses contain bounded excerpts
+and evidence IDs, never full pages, PDF bodies, vectors, prompts, or provider errors.
+Answer mode is deterministic by default, separates observations from inference, and
+only cites evidence returned in the same bundle. It does not produce recommendations or
+invoke external tools.
+
+The collection supports snapshot chunks, deterministic signal summaries, company
+document references, and reserved bounded kinds for future structured facts and
+before/after projections. Current collectors produce website snapshot chunks and signal
+summaries; hiring and GitHub source types are schema-compatible but remain uncollected
+until an approved source collector exists. Company PDF text stays in its existing
+canonical chunk collection and is referenced at retrieval time rather than duplicated.
+
+Correlation is rule-based and Organization-scoped: it can identify multi-source support,
+same-category movement across approved competitors, repeated feature/positioning
+activity, and repeated numeric pricing direction. Trend windows are fixed to 30, 90,
+180, or 365 days and report observed counts, pricing direction, scan coverage, and
+freshness without prediction or statistical-significance claims. Structured synthesis
+has a strict optional adapter with citation validation and deterministic fallback; no
+production generation provider is wired in Phase 6.
+
+Read-only diagnostics and the offline search benchmark:
+
+```powershell
+uv run python scripts/check_intelligence_index.py status
+uv run python scripts/check_intelligence_index.py consistency --organization-id org_example
+uv run python scripts/check_intelligence_index.py sample --organization-id org_example
+uv run python scripts/benchmark_intelligence_search.py
+```
+
+The diagnostic never mutates Pinecone or MongoDB. Live indexing and reindexing require
+explicit provider configuration and an authorized Organization. `GET /health/ready`
+reports whether embeddings and the vector store are available; it fails only when
+`COMPETITOR_EVIDENCE_INDEXING_REQUIRED=true` and the required providers are unavailable.
+
+### Phase 6 authorized smoke test
+
+Run the API, worker, and scheduler as separate processes, then:
+
+1. Sign in through Clerk and select the Avento Organization.
+2. Approve a competitor and run a competitor scan.
+3. Confirm snapshots and any deterministic signals are persisted.
+4. Confirm snapshot/signal indexing jobs are queued and completed by the worker.
+5. Confirm vector count increases only in Avento's derived namespace.
+6. Search `/intelligence` for a known competitor-page fact and verify excerpt, date,
+   competitor, and public source citation.
+7. Ask a historical comparison question and confirm every cited ID is in the returned
+   evidence bundle.
+8. Open the competitor timeline, page backward, and verify signal before/after excerpts.
+9. Switch Organizations and confirm prior evidence, answers, timeline, jobs, and
+   notifications disappear before the new workspace loads.
+10. Queue a reindex in the second Organization and verify it reuses stored snapshots and
+    signals without crawling or recreating changes.
+11. Deactivate an authorized test evidence source, verify MongoDB retrieval eligibility
+    changes immediately, then confirm eventual vector cleanup.
+12. Stop a worker during indexing, wait for lease expiry, restart it, and verify recovery
+    reuses deterministic IDs without duplicate active versions.
+
+This live flow was not executed by the offline automated suite. Do not run it against
+production data or provider accounts without explicit authorization.
+
+### Migration and recovery
+
+Inspect legacy active initialization, scan, and ingestion records before enabling durable workers:
+
+```powershell
+uv run python scripts/migrate_background_jobs.py status
+uv run python scripts/migrate_background_jobs.py plan
+```
+
+Both commands are read-only. Applying is explicit and idempotent:
+
+```powershell
+uv run python scripts/migrate_background_jobs.py apply --confirm-apply
+```
+
+Do not run `apply`, cancellation, retry, or destructive cleanup against real data without confirming the target environment. Old completed domain records remain readable; migration only creates missing durable queue references for legacy queued/running records.
+
+### Current limitations
+
+There is no email or Slack delivery, user-configurable alert routing, sub-daily monitoring, authenticated crawling, anti-bot bypass, or exactly-once guarantee for arbitrary external providers. Idempotency is enforced through queue occurrence keys plus the existing deterministic vector IDs, snapshot uniqueness, signal uniqueness, and notification deduplication. The offline suite does not prove live Clerk, MongoDB failover, Crawl4AI, Gemini, Pinecone, S3, or process-kill behavior; run the documented manual flow in an authorized non-production environment. Phase 6 provides evidence retrieval and historical intelligence; strategic recommendations and autonomous Deep Agent reasoning are reserved for Phase 7.

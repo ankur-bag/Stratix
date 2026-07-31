@@ -26,6 +26,12 @@ from app.domain.documents import (
     DocumentStatus,
 )
 from app.domain.intelligence import CompanyIntelligenceProfile, Snapshot
+from app.domain.intelligence_evidence import (
+    EvidenceSourceKind,
+    EvidenceSourceType,
+    IntelligenceCategory,
+    IntelligenceEvidence,
+)
 from app.domain.monitoring import CompetitorSource
 from app.domain.monitoring import SourceStatus as CompetitorSourceStatus
 from app.domain.onboarding import (
@@ -42,6 +48,12 @@ from app.domain.onboarding import (
 from app.domain.scanning import CompetitorScanJob, CompetitorSnapshot, ScanStage, ScanStatus
 from app.domain.signals import CompetitorSignal, SignalStatus, SignalType
 from app.repositories.interfaces import RepositoryConflictError
+from app.repositories.memory_jobs import (
+    InMemoryBackgroundJobRepository,
+    InMemoryMonitoringScheduleRepository,
+    InMemoryNotificationRepository,
+    InMemoryServiceInstanceRepository,
+)
 
 
 class InMemoryCompanyProfileRepository:
@@ -53,6 +65,9 @@ class InMemoryCompanyProfileRepository:
             raise RepositoryConflictError
         self.items[profile.id] = profile
         return profile
+
+    async def list_organization_ids(self, *, limit: int) -> list[str]:
+        return sorted({item.organization_id for item in self.items.values()})[:limit]
 
     async def get_for_organization(self, organization_id: str) -> CompanyProfile | None:
         return next(
@@ -255,6 +270,20 @@ class InMemoryInitializationJobRepository:
                 "error_message": error_message,
                 "message": error_message,
                 "completed_at": utc_now(),
+            },
+        )
+
+    async def reset_for_retry(
+        self, organization_id: str, job_id: str, message: str
+    ) -> InitializationJob | None:
+        return await self._update(
+            organization_id,
+            job_id,
+            {
+                "status": JobStatus.QUEUED,
+                "stage": JobStage.QUEUED,
+                "message": message,
+                "completed_at": None,
             },
         )
 
@@ -866,6 +895,24 @@ class InMemoryCompetitorScanRepository:
         self.items[scan_id] = updated
         return updated
 
+    async def reset_for_retry(
+        self, organization_id: str, scan_id: str, message: str
+    ) -> CompetitorScanJob | None:
+        current = await self.get_by_id(organization_id, scan_id)
+        if current is None:
+            return None
+        updated = current.model_copy(
+            update={
+                "status": ScanStatus.QUEUED,
+                "stage": ScanStage.QUEUED,
+                "message": message,
+                "completed_at": None,
+                "updated_at": utc_now(),
+            }
+        )
+        self.items[scan_id] = updated
+        return updated
+
 
 class InMemoryCompetitorSnapshotRepository:
     def __init__(self) -> None:
@@ -913,6 +960,37 @@ class InMemoryCompetitorSnapshotRepository:
             ),
             None,
         )
+
+    async def list_for_scan(
+        self, organization_id: str, scan_id: str, *, limit: int = 100
+    ) -> list[CompetitorSnapshot]:
+        return sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id and item.scan_id == scan_id
+            ],
+            key=lambda item: item.id,
+        )[:limit]
+
+    async def list_for_competitor(
+        self,
+        organization_id: str,
+        competitor_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> list[CompetitorSnapshot]:
+        return sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.competitor_id == competitor_id
+                and (cursor is None or item.id > cursor)
+            ],
+            key=lambda item: item.id,
+        )[:limit]
 
 
 class InMemoryCompetitorSignalRepository:
@@ -978,6 +1056,176 @@ class InMemoryCompetitorSignalRepository:
         return updated
 
 
+class InMemoryIntelligenceEvidenceRepository:
+    def __init__(self) -> None:
+        self.items: dict[str, IntelligenceEvidence] = {}
+
+    async def create_many(self, evidence: list[IntelligenceEvidence]) -> list[IntelligenceEvidence]:
+        if any(item.id in self.items for item in evidence):
+            raise RepositoryConflictError
+        self.items.update({item.id: item for item in evidence})
+        return evidence
+
+    async def get_many(
+        self, organization_id: str, evidence_ids: list[str], *, active_only: bool = True
+    ) -> list[IntelligenceEvidence]:
+        requested = set(evidence_ids)
+        return [
+            item
+            for item in self.items.values()
+            if item.organization_id == organization_id
+            and item.id in requested
+            and not item.deleted
+            and (not active_only or item.active)
+        ]
+
+    async def list_for_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> list[IntelligenceEvidence]:
+        return sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.source_kind == source_kind
+                and self._reference(item) == source_reference_id
+                and item.version_key == version_key
+            ],
+            key=lambda item: item.chunk_index or 0,
+        )
+
+    async def list_for_source(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        *,
+        active_only: bool = False,
+    ) -> list[IntelligenceEvidence]:
+        return sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.source_kind == source_kind
+                and self._reference(item) == source_reference_id
+                and (not active_only or (item.active and not item.deleted))
+            ],
+            key=lambda item: item.chunk_index or 0,
+        )
+
+    async def activate_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> None:
+        now = utc_now()
+        for key, item in list(self.items.items()):
+            if (
+                item.organization_id == organization_id
+                and item.source_kind == source_kind
+                and self._reference(item) == source_reference_id
+            ):
+                self.items[key] = item.model_copy(
+                    update={
+                        "active": item.version_key == version_key and not item.deleted,
+                        "updated_at": now,
+                    }
+                )
+
+    async def delete_version(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+        version_key: str,
+    ) -> None:
+        for key, item in list(self.items.items()):
+            if (
+                item.organization_id == organization_id
+                and item.source_kind == source_kind
+                and self._reference(item) == source_reference_id
+                and item.version_key == version_key
+                and not item.active
+            ):
+                self.items.pop(key)
+
+    async def deactivate_source(
+        self,
+        organization_id: str,
+        source_kind: EvidenceSourceKind,
+        source_reference_id: str,
+    ) -> list[str]:
+        vector_ids: list[str] = []
+        for key, item in list(self.items.items()):
+            if (
+                item.organization_id == organization_id
+                and item.source_kind == source_kind
+                and self._reference(item) == source_reference_id
+            ):
+                vector_ids.append(item.vector_id)
+                self.items[key] = item.model_copy(
+                    update={"active": False, "deleted": True, "updated_at": utc_now()}
+                )
+        return vector_ids
+
+    async def list_active(
+        self,
+        organization_id: str,
+        *,
+        competitor_id: str | None = None,
+        competitor_ids: list[str] | None = None,
+        categories: list[IntelligenceCategory] | None = None,
+        source_types: list[EvidenceSourceType] | None = None,
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> list[IntelligenceEvidence]:
+        items = sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.active
+                and not item.deleted
+                and (competitor_id is None or item.competitor_id == competitor_id)
+                and (not competitor_ids or item.competitor_id in competitor_ids)
+                and (not categories or item.category in categories)
+                and (not source_types or item.source_type in source_types)
+                and (observed_after is None or item.observed_at >= observed_after)
+                and (observed_before is None or item.observed_at <= observed_before)
+                and (cursor is None or item.id > cursor)
+            ],
+            key=lambda item: item.id,
+        )
+        return items[:limit]
+
+    async def count_status(self, organization_id: str) -> tuple[int, int, datetime | None]:
+        scoped = [
+            item
+            for item in self.items.values()
+            if item.organization_id == organization_id and not item.deleted
+        ]
+        active = [item for item in scoped if item.active]
+        latest = max((item.updated_at for item in active), default=None)
+        return len(active), len(scoped) - len(active), latest
+
+    @staticmethod
+    def _reference(item: IntelligenceEvidence) -> str | None:
+        return {
+            EvidenceSourceKind.SNAPSHOT: item.snapshot_id,
+            EvidenceSourceKind.SIGNAL: item.signal_id,
+            EvidenceSourceKind.DOCUMENT: item.document_id,
+        }[item.source_kind]
+
+
 class InMemoryCompanyDocumentRepository:
     def __init__(self) -> None:
         self.items: dict[str, CompanyDocument] = {}
@@ -1021,6 +1269,20 @@ class InMemoryCompanyDocumentRepository:
         updated = item.model_copy(update={**changes, "updated_at": utc_now()})
         self.items[document_id] = updated
         return updated
+
+    async def list_expired_pending(
+        self, organization_id: str, *, before: datetime, limit: int
+    ) -> list[CompanyDocument]:
+        return sorted(
+            [
+                item
+                for item in self.items.values()
+                if item.organization_id == organization_id
+                and item.status == DocumentStatus.PENDING_UPLOAD
+                and item.created_at < before
+            ],
+            key=lambda item: (item.created_at, item.id),
+        )[:limit]
 
 
 class InMemoryDocumentIngestionJobRepository:
@@ -1090,6 +1352,24 @@ class InMemoryDocumentIngestionJobRepository:
         self.items[job_id] = updated
         return updated
 
+    async def reset_for_retry(
+        self, organization_id: str, job_id: str, message: str
+    ) -> DocumentIngestionJob | None:
+        item = await self.get_by_id(organization_id, job_id)
+        if item is None:
+            return None
+        updated = item.model_copy(
+            update={
+                "status": DocumentJobStatus.QUEUED,
+                "stage": DocumentStage.VALIDATING,
+                "message": message,
+                "completed_at": None,
+                "updated_at": utc_now(),
+            }
+        )
+        self.items[job_id] = updated
+        return updated
+
 
 class InMemoryCompanyKnowledgeChunkRepository:
     def __init__(self) -> None:
@@ -1147,6 +1427,10 @@ class InMemoryCompanyKnowledgeChunkRepository:
 
 class InMemoryPersistence:
     def __init__(self, *, ready: bool = True) -> None:
+        self.background_jobs = InMemoryBackgroundJobRepository()
+        self.monitoring_schedules = InMemoryMonitoringScheduleRepository()
+        self.notifications = InMemoryNotificationRepository()
+        self.service_instances = InMemoryServiceInstanceRepository()
         self.company_profiles = InMemoryCompanyProfileRepository()
         self.sources = InMemorySourceRepository()
         self.initialization_jobs = InMemoryInitializationJobRepository()
@@ -1163,6 +1447,7 @@ class InMemoryPersistence:
         self.competitor_scans = InMemoryCompetitorScanRepository()
         self.competitor_snapshots = InMemoryCompetitorSnapshotRepository()
         self.competitor_signals = InMemoryCompetitorSignalRepository()
+        self.intelligence_evidence = InMemoryIntelligenceEvidenceRepository()
         self.ready = ready
         self.started = False
         self.closed = False
@@ -1181,7 +1466,7 @@ class RecordingBackgroundExecutor:
     def __init__(self) -> None:
         self.scheduled: list[tuple[str, str]] = []
 
-    def schedule(self, *, job_id: str, organization_id: str) -> None:
+    async def schedule(self, *, job_id: str, organization_id: str) -> None:
         self.scheduled.append((job_id, organization_id))
 
     async def close(self) -> None:
@@ -1192,7 +1477,7 @@ class RecordingCompetitorScanExecutor:
     def __init__(self) -> None:
         self.scheduled: list[tuple[str, str]] = []
 
-    def schedule(self, *, scan_id: str, organization_id: str) -> None:
+    async def schedule(self, *, scan_id: str, organization_id: str) -> None:
         self.scheduled.append((scan_id, organization_id))
 
     async def close(self) -> None:

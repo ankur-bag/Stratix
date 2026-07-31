@@ -1,8 +1,16 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
+import { useOrganization } from "@clerk/nextjs";
 import Link from "next/link";
 import { ApiError } from "@/lib/api/client";
+import {
+  durableJobMessage,
+  monitoringCadences,
+  monitoringScheduleUpdate,
+  monitoringState,
+  organizationStateKey,
+} from "@/lib/api/durable";
 import { isActiveScan, scanOutcome } from "@/lib/api/monitoring";
 import type {
   Competitor,
@@ -10,6 +18,9 @@ import type {
   CompetitorSignal,
   CompetitorSource,
   CompetitorSourceType,
+  CompetitorTimelineItem,
+  MonitoringCadence,
+  MonitoringSchedule,
 } from "@/lib/api/types";
 import { useAuthenticatedApi } from "@/lib/api/use-api";
 
@@ -28,30 +39,54 @@ const sourceTypes: CompetitorSourceType[] = [
 ];
 
 export function CompetitorIntelligence({ competitorId }: { competitorId: string }) {
+  const { organization } = useOrganization();
+  return (
+    <OrganizationCompetitorIntelligence
+      competitorId={competitorId}
+      key={organizationStateKey(organization?.id, competitorId)}
+    />
+  );
+}
+
+function OrganizationCompetitorIntelligence({
+  competitorId,
+}: {
+  competitorId: string;
+}) {
   const api = useAuthenticatedApi();
   const [competitor, setCompetitor] = useState<Competitor | null>(null);
   const [sources, setSources] = useState<CompetitorSource[]>([]);
   const [scans, setScans] = useState<CompetitorScan[]>([]);
   const [signals, setSignals] = useState<CompetitorSignal[]>([]);
+  const [timeline, setTimeline] = useState<CompetitorTimelineItem[]>([]);
+  const [timelineCursor, setTimelineCursor] = useState<string | null>(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [schedule, setSchedule] = useState<MonitoringSchedule | null>(null);
   const [activeScan, setActiveScan] = useState<CompetitorScan | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState("");
   const [sourceType, setSourceType] = useState<CompetitorSourceType>("website");
   const activeScanId = isActiveScan(activeScan) ? activeScan?.id ?? null : null;
 
   const loadWorkspace = useCallback(async (signal?: AbortSignal) => {
-    const [competitorData, sourcePage, scanPage, signalPage] = await Promise.all([
+    const [competitorData, sourcePage, scanPage, signalPage, scheduleData, timelinePage] = await Promise.all([
       api.getCompetitor(competitorId, signal),
       api.listCompetitorSources(competitorId, signal),
       api.listCompetitorScans(competitorId, signal),
       api.listCompetitorSignals(competitorId, signal),
+      api.getMonitoringSchedule(competitorId, signal),
+      api.getCompetitorTimeline(competitorId, { limit: 10 }, signal),
     ]);
     setCompetitor(competitorData);
     setSources(sourcePage.items);
     setScans(scanPage.items);
     setSignals(signalPage.items);
+    setSchedule(scheduleData);
+    setTimeline(timelinePage.items);
+    setTimelineCursor(timelinePage.next_cursor);
     setActiveScan(scanPage.items.find(isActiveScan) ?? null);
   }, [api, competitorId]);
 
@@ -112,6 +147,7 @@ export function CompetitorIntelligence({ competitorId }: { competitorId: string 
     if (!competitor || busy || isActiveScan(activeScan)) return;
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
       const response = await api.startCompetitorScan(competitorId, {
         scan_type: competitor.baseline_status === "ready" ? "rescan" : "baseline",
@@ -119,8 +155,57 @@ export function CompetitorIntelligence({ competitorId }: { competitorId: string 
       });
       setActiveScan(response.scan);
       setScans((items) => [response.scan, ...items]);
+      setNotice(durableJobMessage(response.job));
     } catch (scanError) {
       setError(errorMessage(scanError, "The competitor scan could not be started."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateSchedule(cadence: MonitoringCadence, isEnabled: boolean) {
+    if (!schedule || busy) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await api.updateMonitoringSchedule(competitorId, {
+        cadence,
+        is_enabled: isEnabled && cadence !== "manual",
+        timezone: schedule.timezone,
+      });
+      setSchedule(updated);
+      setNotice(
+        updated.is_enabled
+          ? `Automatic monitoring is ${monitoringCadences
+              .find((item) => item.value === updated.cadence)
+              ?.label.toLowerCase()}.`
+          : "Automatic monitoring is paused. You can still run a scan manually.",
+      );
+    } catch (scheduleError) {
+      setError(
+        errorMessage(scheduleError, "The monitoring schedule could not be updated."),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runMonitoringNow() {
+    if (!competitor || busy || isActiveScan(activeScan)) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await api.runMonitoringNow(competitorId);
+      setActiveScan(response.scan);
+      setScans((items) => [
+        response.scan,
+        ...items.filter((item) => item.id !== response.scan.id),
+      ]);
+      setNotice(durableJobMessage(response.job));
+    } catch (scanError) {
+      setError(errorMessage(scanError, "The competitor scan could not be queued."));
     } finally {
       setBusy(false);
     }
@@ -173,6 +258,29 @@ export function CompetitorIntelligence({ competitorId }: { competitorId: string 
     }
   }
 
+  async function loadMoreTimeline() {
+    if (!timelineCursor || timelineLoading) return;
+    setTimelineLoading(true);
+    setError(null);
+    try {
+      const page = await api.getCompetitorTimeline(
+        competitorId,
+        { cursor: timelineCursor, limit: 10 },
+      );
+      setTimeline((items) => [
+        ...items,
+        ...page.items.filter(
+          (candidate) => !items.some((item) => item.evidence_id === candidate.evidence_id),
+        ),
+      ]);
+      setTimelineCursor(page.next_cursor);
+    } catch (timelineError) {
+      setError(errorMessage(timelineError, "More timeline evidence could not be loaded."));
+    } finally {
+      setTimelineLoading(false);
+    }
+  }
+
   if (loading) {
     return <main className="mx-auto w-full max-w-6xl flex-1 px-6 py-16 text-sm text-zinc-500">Loading competitor intelligence…</main>;
   }
@@ -204,6 +312,7 @@ export function CompetitorIntelligence({ competitorId }: { competitorId: string 
       </header>
 
       {error ? <p role="alert" className="mt-6 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-300">{error}</p> : null}
+      {notice ? <p role="status" className="mt-6 rounded-xl bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:bg-blue-950/40 dark:text-blue-200">{notice}</p> : null}
 
       <section aria-label="Monitoring summary" className="grid gap-px overflow-hidden rounded-2xl border border-black/10 bg-black/10 dark:border-white/10 dark:bg-white/10 sm:grid-cols-4">
         <Summary label="Baseline" value={readable(competitor.baseline_status)} />
@@ -212,7 +321,157 @@ export function CompetitorIntelligence({ competitorId }: { competitorId: string 
         <Summary label="Last scan" value={formatDate(competitor.last_scan_at)} />
       </section>
 
+      {schedule ? (
+        <section
+          aria-busy={busy}
+          aria-labelledby="monitoring-schedule-title"
+          className="mt-8 grid gap-6 rounded-2xl border border-black/10 p-6 dark:border-white/10 lg:grid-cols-[1fr_auto] lg:items-center"
+        >
+          <div>
+            <div className="flex flex-wrap items-center gap-3">
+              <h2 className="text-lg font-semibold" id="monitoring-schedule-title">
+                Monitoring schedule
+              </h2>
+              <StatusPill value={monitoringState(schedule)} />
+            </div>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-500">
+              Scans are placed on the durable queue. Closing this page will not
+              interrupt a queued or running scan.
+            </p>
+            <dl className="mt-5 grid gap-4 text-sm sm:grid-cols-3">
+              <ScheduleMetric label="Next run" value={formatDate(schedule.next_run_at)} />
+              <ScheduleMetric
+                label="Last success"
+                value={formatDate(schedule.last_success_at)}
+              />
+              <ScheduleMetric
+                label="Last failure"
+                value={formatDate(schedule.last_failure_at)}
+              />
+            </dl>
+            {schedule.degraded_reason ? (
+              <p className="mt-4 text-sm text-amber-700 dark:text-amber-300">
+                Automatic monitoring needs attention: {readable(schedule.degraded_reason)}.
+              </p>
+            ) : null}
+          </div>
+          <div className="grid gap-3 sm:grid-cols-[180px_auto_auto] lg:grid-cols-1">
+            <label className="grid gap-2 text-sm font-medium">
+              Cadence
+              <select
+                className="h-11 rounded-lg border border-black/15 bg-white px-3 font-normal dark:border-white/15 dark:bg-zinc-950"
+                disabled={busy}
+                onChange={(event) => {
+                  const cadence = event.target.value as MonitoringCadence;
+                  const update = monitoringScheduleUpdate(cadence);
+                  void updateSchedule(update.cadence, update.is_enabled);
+                }}
+                value={schedule.cadence}
+              >
+                {monitoringCadences.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="h-11 self-end rounded-full border border-black/15 px-5 text-sm font-medium disabled:opacity-45 dark:border-white/15"
+              disabled={busy}
+              onClick={() =>
+                void updateSchedule(
+                  schedule.cadence === "manual" ? "weekly" : schedule.cadence,
+                  !schedule.is_enabled,
+                )
+              }
+              type="button"
+            >
+              {schedule.is_enabled ? "Pause" : "Enable"}
+            </button>
+            <button
+              className="h-11 self-end rounded-full bg-foreground px-5 text-sm font-medium text-background disabled:opacity-45"
+              disabled={controlsDisabled || enabledSources.length === 0}
+              onClick={() => void runMonitoringNow()}
+              type="button"
+            >
+              Run now
+            </button>
+          </div>
+        </section>
+      ) : null}
+
       {latestScan ? <ScanProgress scan={latestScan} /> : null}
+
+      <section className="mt-14" aria-labelledby="evidence-timeline-title">
+        <div>
+          <p className="text-sm font-medium text-zinc-500">Semantic history</p>
+          <h2 className="mt-2 text-2xl font-semibold tracking-tight" id="evidence-timeline-title">
+            Evidence timeline
+          </h2>
+          <p className="mt-3 max-w-2xl text-sm leading-6 text-zinc-500">
+            Canonical snapshots and detected changes, ordered newest first.
+          </p>
+        </div>
+        {timeline.length ? (
+          <>
+            <ol className="mt-7 divide-y divide-black/10 border-y border-black/10 dark:divide-white/10 dark:border-white/10">
+              {timeline.map((item) => (
+                <li className="grid gap-3 py-5 sm:grid-cols-[140px_1fr]" key={item.evidence_id}>
+                  <time className="text-sm text-zinc-500" dateTime={item.observed_at}>
+                    {formatDate(item.observed_at)}
+                  </time>
+                  <div>
+                    <p className="text-xs font-medium uppercase tracking-[0.14em] text-zinc-500">
+                      {readable(item.category)} · {readable(item.source_type)}
+                    </p>
+                    <h3 className="mt-1 font-semibold">{item.title}</h3>
+                    <p className="mt-2 text-sm leading-6 text-zinc-600 dark:text-zinc-400">
+                      {item.excerpt}
+                    </p>
+                    {item.before_excerpt || item.after_excerpt ? (
+                      <div className="mt-4 grid gap-4 md:grid-cols-2">
+                        <Evidence
+                          label="Before"
+                          text={item.before_excerpt ?? "No prior excerpt was available."}
+                        />
+                        <Evidence
+                          label="After"
+                          text={item.after_excerpt ?? "No later excerpt was available."}
+                        />
+                      </div>
+                    ) : null}
+                    {item.source_url ? (
+                      <a
+                        className="mt-3 inline-block text-sm font-medium underline underline-offset-4"
+                        href={item.source_url}
+                        rel="noreferrer"
+                        target="_blank"
+                      >
+                        View source ↗
+                      </a>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ol>
+            {timelineCursor ? (
+              <button
+                className="mt-5 rounded-full border border-black/15 px-5 py-2 text-sm font-medium disabled:opacity-45 dark:border-white/15"
+                disabled={timelineLoading}
+                onClick={() => void loadMoreTimeline()}
+                type="button"
+              >
+                {timelineLoading ? "Loading…" : "Load earlier evidence"}
+              </button>
+            ) : null}
+          </>
+        ) : (
+          <EmptyState
+            title="No indexed history yet"
+            body="Run a scan and wait for the evidence indexing worker to complete."
+          />
+        )}
+      </section>
 
       <section className="mt-14">
         <div className="flex flex-wrap items-end justify-between gap-4">
@@ -269,6 +528,7 @@ function SignalCard({ signal, onUpdate }: { signal: CompetitorSignal; onUpdate: 
 function Evidence({ label, text }: { label: string; text: string }) { return <div><p className="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">{label}</p><blockquote className="mt-2 text-sm leading-6 text-zinc-700 dark:text-zinc-300">{text}</blockquote></div>; }
 function Summary({ label, value }: { label: string; value: string }) { return <div className="bg-background p-5"><dt className="text-xs font-medium uppercase tracking-wider text-zinc-500">{label}</dt><dd className="mt-2 text-sm font-semibold">{value}</dd></div>; }
 function Metric({ label, value }: { label: string; value: number }) { return <div><dt className="text-zinc-500">{label}</dt><dd className="mt-1 font-semibold tabular-nums">{value}</dd></div>; }
+function ScheduleMetric({ label, value }: { label: string; value: string }) { return <div><dt className="text-zinc-500">{label}</dt><dd className="mt-1 font-medium">{value}</dd></div>; }
 function EmptyState({ title, body }: { title: string; body: string }) { return <div className="mt-7 rounded-2xl border border-dashed border-black/20 px-6 py-10 text-center dark:border-white/20"><h3 className="font-semibold">{title}</h3><p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-zinc-500">{body}</p></div>; }
 function StatusPill({ value }: { value: string }) { return <span className="rounded-full bg-zinc-100 px-2.5 py-1 text-xs font-medium capitalize text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200">{readable(value)}</span>; }
 function readable(value: string): string { return value.replaceAll("_", " "); }

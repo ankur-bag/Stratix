@@ -19,11 +19,18 @@ from app.core.logging import configure_logging, get_logger
 from app.crawlers.crawl4ai_adapter import Crawl4AIWebsiteCrawler
 from app.crawlers.models import WebsiteCrawler
 from app.crawlers.policy import CrawlPolicy, SystemDNSResolver
+from app.domain.background_jobs import JobType
 from app.graphs.company_initialization import CompanyInitializationGraph
 from app.graphs.competitor_scan import CompetitorScanGraph
 from app.middleware import RequestContextMiddleware
 from app.repositories.interfaces import Persistence
 from app.repositories.mongo import MongoPersistence
+from app.services.background_jobs import (
+    BackgroundJobQueue,
+    BackgroundJobService,
+    DurableCompetitorScanExecutor,
+    DurableJobExecutor,
+)
 from app.services.change_detection import DeterministicChangeDetector
 from app.services.company_documents import (
     CompanyDocumentService,
@@ -64,7 +71,17 @@ from app.services.initialization import (
     CompanyInitializationRunner,
     InProcessBackgroundExecutor,
 )
+from app.services.intelligence import (
+    CompetitorEvidenceIndexingService,
+    IntelligenceSearchService,
+)
+from app.services.intelligence_jobs import (
+    EvidenceIndexingScheduler,
+    IntelligenceReindexService,
+)
+from app.services.monitoring_schedules import MonitoringScheduleService
 from app.services.normalization import ContentNormalizer
+from app.services.notifications import NotificationService
 from app.services.onboarding import CompanyOnboardingService
 from app.services.pdf_processing import DeterministicPdfChunker, PdfExtractor
 from app.services.scanning import (
@@ -212,6 +229,14 @@ def create_app(
             await active_vectors.close()
             active_vectors = DisabledVectorStore()
             await active_vectors.start()
+        job_queue = BackgroundJobQueue(application_persistence, application_settings)
+        evidence_indexing_service = CompetitorEvidenceIndexingService(
+            persistence=application_persistence,
+            embeddings=application_embeddings,
+            vectors=active_vectors,
+            settings=application_settings,
+        )
+        evidence_indexing_scheduler = EvidenceIndexingScheduler(application_persistence, job_queue)
         document_runner = DocumentIngestionRunner(
             persistence=application_persistence,
             storage=application_document_storage,
@@ -228,10 +253,19 @@ def create_app(
             embeddings=application_embeddings,
             vectors=active_vectors,
             settings=application_settings,
+            cleanup_queue=job_queue,
         )
-        document_executor = document_background_executor or InProcessBackgroundExecutor(
-            document_runner
-        )
+        if document_background_executor is not None:
+            document_executor = document_background_executor
+        elif application_settings.background_jobs_enabled:
+            document_executor = DurableJobExecutor(
+                job_queue,
+                application_persistence,
+                JobType.DOCUMENT_INGESTION,
+                "document_ingestion",
+            )
+        else:
+            document_executor = InProcessBackgroundExecutor(document_runner)
         document_service = CompanyDocumentService(
             persistence=application_persistence,
             storage=application_document_storage,
@@ -239,6 +273,7 @@ def create_app(
             embeddings=application_embeddings,
             vectors=active_vectors,
             settings=application_settings,
+            cleanup_queue=job_queue,
         )
         source_service = CompetitorSourceService(application_persistence)
         source_discovery = DeterministicCompetitorSourceDiscoveryService(
@@ -258,8 +293,18 @@ def create_app(
             settings=application_settings,
         )
         scan_runner = GraphCompetitorScanRunner(application_persistence, scan_graph)
-        scan_executor = competitor_scan_executor or InProcessCompetitorScanExecutor(scan_runner)
+        if competitor_scan_executor is not None:
+            scan_executor = competitor_scan_executor
+        elif application_settings.background_jobs_enabled:
+            scan_executor = DurableCompetitorScanExecutor(job_queue, application_persistence)
+        else:
+            scan_executor = InProcessCompetitorScanExecutor(scan_runner)
         scan_service = CompetitorScanService(application_persistence, scan_executor)
+        monitoring_schedule_service = MonitoringScheduleService(
+            application_persistence,
+            scan_service,
+            application_settings,
+        )
         graph = CompanyInitializationGraph(
             persistence=application_persistence,
             crawler=application_crawler,
@@ -280,14 +325,36 @@ def create_app(
             application_persistence,
             discovery_executor,
             scan_service if application_settings.auto_start_competitor_baseline else None,
+            monitoring_schedule_service,
         )
         runner = CompanyInitializationRunner(
             application_persistence,
             graph,
             discovery_service if application_settings.auto_start_competitor_discovery else None,
         )
-        executor = background_executor or InProcessBackgroundExecutor(runner)
+        if background_executor is not None:
+            executor = background_executor
+            rebuild_executor = background_executor
+        elif application_settings.background_jobs_enabled:
+            executor = DurableJobExecutor(
+                job_queue,
+                application_persistence,
+                JobType.COMPANY_INITIALIZATION,
+                "initialization_job",
+            )
+            rebuild_executor = DurableJobExecutor(
+                job_queue,
+                application_persistence,
+                JobType.COMPANY_INTELLIGENCE_REBUILD,
+                "initialization_job",
+            )
+        else:
+            executor = InProcessBackgroundExecutor(runner)
+            rebuild_executor = executor
         application.state.persistence = application_persistence
+        application.state.background_job_queue = job_queue
+        application.state.evidence_indexing_service = evidence_indexing_service
+        application.state.evidence_indexing_scheduler = evidence_indexing_scheduler
         application.state.background_executor = executor
         application.state.initialization_runner = runner
         application.state.discovery_runner = discovery_runner
@@ -301,10 +368,30 @@ def create_app(
             application_persistence
         )
         application.state.company_document_service = document_service
+        application.state.document_storage = application_document_storage
+        application.state.vector_store = active_vectors
+        application.state.embedding_provider = application_embeddings
         application.state.document_ingestion_runner = document_runner
         application.state.document_background_executor = document_executor
+        application.state.background_job_service = BackgroundJobService(
+            application_persistence, job_queue
+        )
+        application.state.monitoring_schedule_service = monitoring_schedule_service
+        application.state.notification_service = NotificationService(application_persistence)
+        application.state.intelligence_search_service = IntelligenceSearchService(
+            persistence=application_persistence,
+            embeddings=application_embeddings,
+            vectors=active_vectors,
+            settings=application_settings,
+        )
+        application.state.intelligence_reindex_service = IntelligenceReindexService(
+            application_persistence, job_queue
+        )
         application.state.onboarding_service = CompanyOnboardingService(
-            application_persistence, executor, document_service
+            application_persistence,
+            executor,
+            document_service,
+            rebuild_executor,
         )
         application.state.ready = True
         logger.info("application_started", environment=application_settings.app_env)
@@ -313,6 +400,8 @@ def create_app(
         finally:
             application.state.ready = False
             await executor.close()
+            if rebuild_executor is not executor:
+                await rebuild_executor.close()
             if discovery_executor is not executor:
                 await discovery_executor.close()
             await scan_executor.close()

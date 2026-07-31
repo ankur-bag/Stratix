@@ -87,6 +87,17 @@ class CompetitorBaselineStarter(Protocol):
     ) -> None: ...
 
 
+class MonitoringScheduleStarter(Protocol):
+    async def ensure_default(
+        self,
+        *,
+        organization_id: str,
+        company_profile_id: str,
+        competitor_id: str,
+        created_by_user_id: str,
+    ) -> object: ...
+
+
 class DiscoveryClassificationError(Exception):
     """Structured classification referenced unsupported candidate evidence."""
 
@@ -457,10 +468,12 @@ class CompetitorDiscoveryService:
         persistence: Persistence,
         executor: BackgroundExecutor,
         baseline_starter: CompetitorBaselineStarter | None = None,
+        monitoring_schedule_starter: MonitoringScheduleStarter | None = None,
     ) -> None:
         self._persistence = persistence
         self._executor = executor
         self._baseline_starter = baseline_starter
+        self._monitoring_schedule_starter = monitoring_schedule_starter
 
     async def start(
         self, *, context: AuthenticatedContext, idempotency_key: str
@@ -532,7 +545,7 @@ class CompetitorDiscoveryService:
                     status_code=409,
                 ) from None
             return self._response(existing)
-        self._executor.schedule(job_id=job.id, organization_id=context.organization_id)
+        await self._executor.schedule(job_id=job.id, organization_id=context.organization_id)
         return self._response(job)
 
     async def start_auto(
@@ -725,6 +738,13 @@ class CompetitorDiscoveryService:
                 message="A competitor with this domain already exists.",
                 status_code=409,
             ) from exc
+        if self._monitoring_schedule_starter is not None:
+            await self._monitoring_schedule_starter.ensure_default(
+                organization_id=context.organization_id,
+                company_profile_id=competitor.company_profile_id,
+                competitor_id=competitor.id,
+                created_by_user_id=context.user_id,
+            )
         if self._baseline_starter is not None:
             # Approval must survive independent background scheduling failures.
             with suppress(Exception):

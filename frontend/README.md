@@ -53,6 +53,7 @@ Server-protected routes:
 - `/companies` and `/companies/new`
 - `/dashboard` and `/dashboard/**`
 - `/competitors` and `/competitors/**`
+- `/intelligence`
 - `/settings` and `/settings/**`
 
 Next.js 16 uses `proxy.ts` with `clerkMiddleware()` and the Clerk-recommended matcher. Sensitive route access is enforced again in the protected App Router layout with `await auth()`.
@@ -112,3 +113,38 @@ npm run build
 The lightweight offline tests use Node's built-in test runner with TypeScript transformation; they cover Organization-scoped bearer tokens, missing Organization/token handling, stale-response rejection, cancellation, company-field validation, activation settling, and centralized workspace routing. Browser-level Clerk redirects and live sign-in are not automated in this repository.
 
 Manual browser smoke tests remain required for creating two companies, switching repeatedly while requests poll, verifying each company lands on its own onboarding/dashboard state, reloading after a switch, and confirming no previous-company data flashes. Also verify baseline polling, source-domain and robots warnings, evidence links, and narrow screens. Do not run a live competitor crawl without authorization.
+
+## Phase 5 monitoring and notifications
+
+An approved competitor workspace now includes an Organization-scoped monitoring schedule. Users can choose Manual only, Daily, Every 3 days, or Weekly; pause/enable automatic monitoring; inspect the next run plus last success/failure; and select **Run now**. Run now returns an accepted domain scan and durable-job summary. The confirmation explicitly says the work is safely queued, so leaving or refreshing the page does not imply cancellation.
+
+Queued/running progress continues through the domain-specific scan endpoint. Polling is bounded, aborts on unmount, and ignores stale responses after a Clerk Organization change. Automatic schedules and manual scans share the same source-safety checks and active competitor lock.
+
+Authenticated navigation includes one notification control with an unread badge, recent bounded list, loading/empty/error states, mark-one-read, and mark-all-read. It polls every 45 seconds only while the document is visible. Hiding the tab aborts the active request and clears the timer; returning to the tab refreshes immediately. The control is keyed by the active Clerk Organization, so a switch unmounts the old state before the new Organization is fetched and no prior-company notification flash is retained.
+
+The browser never submits an Organization ID or calls crawlers, Gemini, Pinecone, storage, or other providers directly. All monitoring and notification requests flow through `lib/api/client.ts`, acquire a fresh active-Organization Clerk token, abort cleanly, and reject responses that arrive after an Organization switch.
+
+At least one backend worker process is required to execute queued work. At least one backend scheduler process is required for automatic monitoring. The FastAPI API does not run long-running jobs directly in production.
+
+## Phase 6 intelligence workspace
+
+`/intelligence` is the Organization-scoped executive evidence workspace. It loads indexing
+health, recent canonical changes, deterministic category trends, and cross-source
+correlations. Users can search in ranked-evidence mode or build a deterministic,
+evidence-cited answer; competitor, date-range, category, source, and optional company
+context filters are sent only through the authenticated FastAPI client.
+
+Every search is abortable. Changing a filter or mode cancels the active request and clears
+its results, unmounting aborts all workspace requests, and a Clerk Organization switch
+remounts the workspace with empty state before loading the new Organization. Evidence
+rows show bounded excerpts, dates, categories, source labels, and public source links.
+The UI never receives full crawled pages, PDF bodies, vectors, prompts, namespaces, or
+provider credentials.
+
+The reindex action queues one durable Organization job and leaves the currently active
+evidence searchable while the new projection is prepared. Indexing warnings describe a
+recoverable workspace state without implying that the underlying competitor scan failed.
+Competitor detail pages also expose a paginated canonical evidence timeline with source
+dates and signal before/after excerpts. Phase 6 provides evidence retrieval and
+historical intelligence; strategic recommendations and autonomous Deep Agent reasoning
+remain reserved for Phase 7.
