@@ -28,3 +28,22 @@ def test_report_schema_rejects_unknown_fields() -> None:
     payload["hidden_reasoning"] = "secret"
     with pytest.raises(ValidationError):
         type(strategy_output()).model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "section",
+    ["situation_assessment", "inferences", "threats", "opportunities"],
+)
+def test_every_substantive_claim_section_rejects_missing_citations(section: str) -> None:
+    payload = strategy_output().model_dump()
+    payload[section][0]["evidence_ids"] = []
+    with pytest.raises(ValidationError):
+        type(strategy_output()).model_validate(payload)
+
+
+def test_recommendation_requires_evidence_assumptions_risks_and_success_indicators() -> None:
+    for field in ("evidence_ids", "assumptions", "risks", "success_indicators"):
+        payload = strategy_output().model_dump()
+        payload["recommendations"][0][field] = []
+        with pytest.raises(ValidationError):
+            type(strategy_output()).model_validate(payload)

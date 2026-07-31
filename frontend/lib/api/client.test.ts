@@ -628,3 +628,50 @@ test("strategic run creation sends only bounded user inputs", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("strategic lifecycle, citations, and feedback stay on encoded FastAPI routes", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; method: string; body: string | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    requests.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      body: typeof init?.body === "string" ? init.body : null,
+    });
+    return Response.json({ items: [], run: {}, evidence_id: "evidence/1" });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.listStrategyRuns();
+    await api.getStrategyRun("run/1");
+    await api.cancelStrategyRun("run/1");
+    await api.retryStrategyRun("run/1");
+    await api.listStrategicReports();
+    await api.getStrategicReport("report/1");
+    await api.getStrategicCitation("report/1", "evidence/1");
+    await api.submitStrategicFeedback("report/1", "helpful", "Useful summary");
+
+    assert.deepEqual(
+      requests.map((item) => [item.method, item.url]),
+      [
+        ["GET", "http://api.test/api/v1/strategy/runs?limit=25"],
+        ["GET", "http://api.test/api/v1/strategy/runs/run%2F1"],
+        ["POST", "http://api.test/api/v1/strategy/runs/run%2F1/cancel"],
+        ["POST", "http://api.test/api/v1/strategy/runs/run%2F1/retry"],
+        ["GET", "http://api.test/api/v1/strategy/reports?limit=25"],
+        ["GET", "http://api.test/api/v1/strategy/reports/report%2F1"],
+        [
+          "GET",
+          "http://api.test/api/v1/strategy/reports/report%2F1/citations/evidence%2F1",
+        ],
+        ["POST", "http://api.test/api/v1/strategy/reports/report%2F1/feedback"],
+      ],
+    );
+    const feedback = JSON.parse(requests.at(-1)?.body ?? "{}");
+    assert.deepEqual(feedback, { feedback: "helpful", comment: "Useful summary" });
+    assert.equal(requests.some((item) => item.url.includes("organization_id")), false);
+    assert.equal(requests.some((item) => item.url.includes("pinecone")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

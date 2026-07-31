@@ -1,6 +1,7 @@
 import asyncio
 
 import pytest
+from pydantic import ValidationError
 
 from app.agents.errors import StrategicAgentError
 from app.agents.tools import (
@@ -90,3 +91,56 @@ async def test_total_and_per_specialist_tool_budgets_are_enforced() -> None:
     with pytest.raises(StrategicAgentError) as error:
         await company_tool.ainvoke({})
     assert error.value.code == "STRATEGIC_AGENT_TOOL_LIMIT_EXCEEDED"
+
+
+def test_tool_context_tenant_and_company_are_immutable() -> None:
+    context = agent_context()
+    with pytest.raises(ValidationError):
+        context.organization_id = "org_foreign"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        context.company_profile_id = "company-foreign"  # type: ignore[misc]
+
+
+@pytest.mark.anyio
+async def test_tool_checks_cancellation_before_reading_application_data() -> None:
+    persistence = InMemoryPersistence()
+    persistence.company_profiles.items["company-1"] = company_profile()
+    settings = Settings(app_env="testing", _env_file=None)
+    factory = tool_factory(persistence, settings)
+    runtime = factory.runtime(agent_context(), lambda: asyncio.sleep(0, result=False))
+    company_tool = next(
+        item
+        for item in factory.build(runtime, role="primary")
+        if item.name == "get_company_context"
+    )
+
+    with pytest.raises(StrategicAgentError) as error:
+        await company_tool.ainvoke({})
+
+    assert error.value.code == "STRATEGIC_AGENT_RUN_CANCELLED"
+    assert runtime.tool_call_count == 0
+
+
+@pytest.mark.anyio
+async def test_evidence_detail_count_and_total_output_characters_are_bounded() -> None:
+    persistence = InMemoryPersistence()
+    persistence.company_profiles.items["company-1"] = company_profile()
+    settings = Settings(
+        app_env="testing",
+        strategic_agent_max_evidence_per_tool_call=2,
+        strategic_agent_max_context_characters=100,
+        _env_file=None,
+    )
+    factory = tool_factory(persistence, settings)
+    runtime = factory.runtime(agent_context(), lambda: asyncio.sleep(0, result=True))
+    tools = {item.name: item for item in factory.build(runtime, role="primary")}
+
+    with pytest.raises(StrategicAgentError) as error:
+        await tools["get_evidence_details"].ainvoke(
+            {"evidence_ids": ["evidence-1", "evidence-2", "evidence-3"]}
+        )
+    assert error.value.code == "STRATEGIC_AGENT_INVALID_TOOL_ARGUMENTS"
+
+    output = await tools["get_company_context"].ainvoke({})
+    assert output["truncated"] is True
+    assert output["items"] == []

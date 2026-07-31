@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  shouldPollStrategyRun,
   strategyStageLabel,
+  toggleStrategyCompetitor,
   toUtcBoundary,
   validateStrategyInput,
 } from "./strategy.ts";
@@ -26,3 +28,25 @@ test("date inputs become explicit UTC boundaries", () => {
   assert.equal(toUtcBoundary("2026-07-31", true), "2026-07-31T23:59:59.999Z");
 });
 
+test("strategy polling pauses in hidden tabs and stops for terminal runs", () => {
+  assert.equal(shouldPollStrategyRun("analyzing", false), true);
+  assert.equal(shouldPollStrategyRun("analyzing", true), false);
+  assert.equal(shouldPollStrategyRun("succeeded", false), false);
+  assert.equal(shouldPollStrategyRun("cancelled", false), false);
+});
+
+test("competitor selection is bounded and supports deselection", () => {
+  const selected = Array.from({ length: 10 }, (_, index) => `competitor-${index}`);
+  assert.equal(toggleStrategyCompetitor(selected, "competitor-extra"), selected);
+  assert.deepEqual(toggleStrategyCompetitor(selected, "competitor-3"), [
+    "competitor-0",
+    "competitor-1",
+    "competitor-2",
+    "competitor-4",
+    "competitor-5",
+    "competitor-6",
+    "competitor-7",
+    "competitor-8",
+    "competitor-9",
+  ]);
+});

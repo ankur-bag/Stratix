@@ -71,3 +71,20 @@ export function toUtcBoundary(value: string, endOfDay = false): string {
   return new Date(`${value}T${endOfDay ? "23:59:59.999" : "00:00:00.000"}Z`).toISOString();
 }
 
+export function shouldPollStrategyRun(
+  status: StrategyRunStatus,
+  documentHidden: boolean,
+): boolean {
+  return ACTIVE_STRATEGY_STATUSES.has(status) && !documentHidden;
+}
+
+export function toggleStrategyCompetitor(
+  selected: string[],
+  competitorId: string,
+  maximum = 10,
+): string[] {
+  if (selected.includes(competitorId)) {
+    return selected.filter((item) => item !== competitorId);
+  }
+  return selected.length < maximum ? [...selected, competitorId] : selected;
+}

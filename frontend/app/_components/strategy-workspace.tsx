@@ -17,8 +17,10 @@ import { useAuthenticatedApi } from "@/lib/api/use-api";
 import {
   ACTIVE_STRATEGY_STATUSES,
   dateInputValue,
+  shouldPollStrategyRun,
   strategyModeLabel,
   strategyStageLabel,
+  toggleStrategyCompetitor,
   toUtcBoundary,
   validateStrategyInput,
 } from "@/lib/strategy";
@@ -118,15 +120,16 @@ function OrganizationStrategyWorkspace() {
   const activeRunId = activeRun?.id;
   const activeRunStatus = activeRun?.status;
   useEffect(() => {
-    if (!activeRunId || !activeRunStatus || !ACTIVE_STRATEGY_STATUSES.has(activeRunStatus)) return;
+    if (!activeRunId || !activeRunStatus || !shouldPollStrategyRun(activeRunStatus, false)) return;
     const runId = activeRunId;
+    const runStatus = activeRunStatus;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let controller: AbortController | null = null;
 
     async function poll() {
       if (stopped) return;
-      if (document.hidden) {
+      if (!shouldPollStrategyRun(runStatus, document.hidden)) {
         timer = setTimeout(poll, 8000);
         return;
       }
@@ -305,13 +308,7 @@ function OrganizationStrategyWorkspace() {
   }
 
   function toggleCompetitor(id: string) {
-    setSelectedCompetitors((items) =>
-      items.includes(id)
-        ? items.filter((item) => item !== id)
-        : items.length < 10
-          ? [...items, id]
-          : items,
-    );
+    setSelectedCompetitors((items) => toggleStrategyCompetitor(items, id));
   }
 
   if (loading) {

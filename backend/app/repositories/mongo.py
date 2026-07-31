@@ -1925,7 +1925,7 @@ class MongoStrategyRunRepository:
                 }
             )
         )
-        averages = await _mongo(
+        averages_cursor = await _mongo(
             self._collection.aggregate(
                 [
                     {
@@ -1935,8 +1935,9 @@ class MongoStrategyRunRepository:
                         }
                     }
                 ]
-            ).to_list(length=1)
+            )
         )
+        averages = await _mongo(averages_cursor.to_list(length=1))
         return StrategyOperationalDiagnostics(
             active_runs=int(active_runs),
             oldest_queued_at=oldest_queued.get("created_at") if oldest_queued else None,

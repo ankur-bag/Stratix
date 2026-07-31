@@ -1,6 +1,7 @@
 import pytest
 
-from app.agents.strategic import FakeStrategicAgent
+from app.agents.errors import StrategicAgentError
+from app.agents.strategic import FakeStrategicAgent, StrategicAgent
 from app.core.auth import AuthenticatedContext
 from app.core.config import Settings
 from app.domain.background_jobs import BackgroundJobStatus, JobType
@@ -25,8 +26,10 @@ from tests.strategic_helpers import strategy_evidence, strategy_output
 
 def strategic_runtime(
     persistence: InMemoryPersistence,
+    agent: StrategicAgent | None = None,
+    settings: Settings | None = None,
 ) -> tuple[Settings, StrategyService, StrategicAnalysisRunner]:
-    settings = Settings(
+    settings = settings or Settings(
         app_env="testing",
         background_jobs_enabled=True,
         job_heartbeat_interval_seconds=1,
@@ -50,7 +53,7 @@ def strategic_runtime(
     runner = StrategicAnalysisRunner(
         persistence=persistence,
         intelligence=intelligence,
-        agent=FakeStrategicAgent(strategy_output(), tool_call_count=2, subagent_count=1),
+        agent=agent or FakeStrategicAgent(strategy_output(), tool_call_count=2, subagent_count=1),
         settings=settings,
     )
     return settings, service, runner
@@ -119,3 +122,83 @@ async def test_duplicate_active_request_reuses_run() -> None:
     second = await service.create_run(context, request)
     assert second.run.id == first.run.id
     assert len(persistence.strategy_runs.items) == 1
+
+
+@pytest.mark.anyio
+async def test_retryable_provider_timeout_schedules_durable_retry_with_same_run() -> None:
+    persistence = await seeded_persistence()
+    agent = FakeStrategicAgent(
+        error=StrategicAgentError(
+            "STRATEGIC_AGENT_TIMEOUT",
+            "The strategic model timed out.",
+            retryable=True,
+        )
+    )
+    settings, service, runner = strategic_runtime(persistence, agent=agent)
+    context = AuthenticatedContext(user_id="user_test", organization_id="org_test")
+    created = await service.create_run(
+        context,
+        StrategyRunCreate(mode=StrategyMode.ASK, query="What changed?"),
+    )
+    worker = DurableWorker(
+        persistence=persistence,
+        handlers={JobType.STRATEGIC_ANALYSIS: StrategicAnalysisJobHandler(runner)},
+        settings=settings,
+        worker_id="strategy-worker",
+    )
+
+    assert await worker.run_once()
+    await worker.drain()
+
+    run = await persistence.strategy_runs.get_by_id("org_test", created.run.id)
+    job = next(iter(persistence.background_jobs.items.values()))
+    assert run and run.id == created.run.id
+    assert run.status == StrategyRunStatus.QUEUED
+    assert run.stage == "awaiting_retry"
+    assert job.status == BackgroundJobStatus.RETRY_SCHEDULED
+    assert not persistence.strategy_reports.items
+
+
+@pytest.mark.anyio
+async def test_exhausted_provider_attempt_uses_safe_partial_without_recommendations() -> None:
+    persistence = await seeded_persistence()
+    agent = FakeStrategicAgent(
+        error=StrategicAgentError(
+            "STRATEGIC_AGENT_TIMEOUT",
+            "The strategic model timed out.",
+            retryable=True,
+        )
+    )
+    settings = Settings(
+        app_env="testing",
+        background_jobs_enabled=True,
+        job_max_attempts_default=1,
+        job_heartbeat_interval_seconds=1,
+        job_lease_duration_seconds=10,
+        _env_file=None,
+    )
+    settings, service, runner = strategic_runtime(
+        persistence,
+        agent=agent,
+        settings=settings,
+    )
+    context = AuthenticatedContext(user_id="user_test", organization_id="org_test")
+    created = await service.create_run(
+        context,
+        StrategyRunCreate(mode=StrategyMode.ASK, query="What changed?"),
+    )
+    worker = DurableWorker(
+        persistence=persistence,
+        handlers={JobType.STRATEGIC_ANALYSIS: StrategicAnalysisJobHandler(runner)},
+        settings=settings,
+        worker_id="strategy-worker",
+    )
+
+    assert await worker.run_once()
+    await worker.drain()
+
+    run = await persistence.strategy_runs.get_by_id("org_test", created.run.id)
+    report = next(iter(persistence.strategy_reports.items.values()))
+    assert run and run.status == StrategyRunStatus.PARTIALLY_SUCCEEDED
+    assert report.deterministic_fallback is True
+    assert report.recommendations == []
