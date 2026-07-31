@@ -15,6 +15,7 @@ from app.services.notifications import NotificationService
 from app.services.onboarding import CompanyOnboardingService
 from app.services.scanning import CompetitorScanService
 from app.services.signals import CompetitorSignalService
+from app.services.strategy import StrategyService
 
 
 async def get_authenticated_context(request: Request) -> AuthenticatedContext:
@@ -109,6 +110,10 @@ def get_intelligence_reindex_service(request: Request) -> IntelligenceReindexSer
     return cast(IntelligenceReindexService, request.app.state.intelligence_reindex_service)
 
 
+def get_strategy_service(request: Request) -> StrategyService:
+    return cast(StrategyService, request.app.state.strategy_service)
+
+
 Authenticated = Annotated[AuthenticatedContext, Depends(require_active_organization)]
 OnboardingService = Annotated[CompanyOnboardingService, Depends(get_onboarding_service)]
 DiscoveryService = Annotated[CompetitorDiscoveryService, Depends(get_discovery_service)]
@@ -127,3 +132,4 @@ IntelligenceSearch = Annotated[IntelligenceSearchService, Depends(get_intelligen
 IntelligenceReindex = Annotated[
     IntelligenceReindexService, Depends(get_intelligence_reindex_service)
 ]
+StrategicAnalysisService = Annotated[StrategyService, Depends(get_strategy_service)]

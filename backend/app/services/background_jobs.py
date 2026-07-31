@@ -3,7 +3,7 @@ import random
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Protocol
 
@@ -28,6 +28,7 @@ from app.domain.background_jobs import (
 from app.domain.documents import DocumentJobStatus, DocumentStage, DocumentStatus
 from app.domain.onboarding import JobStatus
 from app.domain.scanning import ScanStatus
+from app.domain.strategy import StrategyRunStatus
 from app.repositories.interfaces import (
     Persistence,
     RepositoryConflictError,
@@ -140,6 +141,20 @@ async def mark_domain_cancelled(persistence: Persistence, job: BackgroundJob) ->
                         "error_message": message,
                     },
                 )
+    elif job.job_type == JobType.STRATEGIC_ANALYSIS:
+        await persistence.strategy_runs.update(
+            job.organization_id,
+            job.domain_resource_id,
+            {
+                "status": StrategyRunStatus.CANCELLED,
+                "stage": "cancelled",
+                "message": message,
+                "error_code": "STRATEGIC_AGENT_RUN_CANCELLED",
+                "error_message": message,
+                "cancelled_at": datetime.now(UTC),
+                "completed_at": datetime.now(UTC),
+            },
+        )
 
 
 class BackgroundJobQueue:
@@ -857,6 +872,10 @@ class NotificationEmitter:
                 notification_type = NotificationType.COMPETITOR_INTELLIGENCE_REINDEX_FAILED
                 title = "Intelligence reindexing failed"
                 action_url = "/intelligence"
+            elif job.job_type == JobType.STRATEGIC_ANALYSIS:
+                notification_type = NotificationType.STRATEGIC_REPORT_FAILED
+                title = "Strategic analysis needs attention"
+                action_url = "/strategy"
             else:
                 notification_type = NotificationType.JOB_DEAD_LETTERED
                 title = "A background job needs attention"
@@ -867,6 +886,22 @@ class NotificationEmitter:
             title = "Competitor intelligence is up to date"
             message = "Workspace evidence reindexing completed."
             action_url = "/intelligence"
+        elif job.job_type == JobType.STRATEGIC_ANALYSIS:
+            partial = bool(job.result_summary.get("deterministic_fallback"))
+            notification_type = (
+                NotificationType.STRATEGIC_REPORT_PARTIAL
+                if partial
+                else NotificationType.STRATEGIC_REPORT_READY
+            )
+            severity = NotificationSeverity.WARNING if partial else NotificationSeverity.INFO
+            title = "Verified evidence summary ready" if partial else "Strategic report ready"
+            message = (
+                "The model result was unavailable; Stratix retained a verified evidence summary."
+                if partial
+                else "Your evidence-grounded strategic analysis is ready to review."
+            )
+            report_id = str(job.result_summary.get("report_id", ""))
+            action_url = f"/strategy?report={report_id}" if report_id else "/strategy"
         if notification_type is None:
             return
         now = self._clock.now()
@@ -940,6 +975,9 @@ class DurableWorker:
             JobType.COMPETITOR_INTELLIGENCE_REINDEX: asyncio.Semaphore(1),
             JobType.COMPETITOR_EVIDENCE_CLEANUP: asyncio.Semaphore(
                 settings.cleanup_job_max_concurrency
+            ),
+            JobType.STRATEGIC_ANALYSIS: asyncio.Semaphore(
+                settings.strategic_agent_max_concurrent_runs_global
             ),
         }
         self._organization_semaphores: dict[str, asyncio.Semaphore] = {}
@@ -1256,3 +1294,16 @@ class DurableWorker:
                     error_code="JOB_LEASE_EXPIRED",
                     error_message=message,
                 )
+        elif job.job_type == JobType.STRATEGIC_ANALYSIS:
+            await self._persistence.strategy_runs.update(
+                job.organization_id,
+                job.domain_resource_id,
+                {
+                    "status": (StrategyRunStatus.QUEUED if retrying else StrategyRunStatus.FAILED),
+                    "stage": "awaiting_retry" if retrying else "failed",
+                    "message": message,
+                    "error_code": None if retrying else "STRATEGIC_AGENT_LEASE_LOST",
+                    "error_message": None if retrying else message,
+                    **({} if retrying else {"completed_at": self._clock.now()}),
+                },
+            )

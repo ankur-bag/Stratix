@@ -27,6 +27,22 @@ def test_readiness(client: TestClient) -> None:
             "embeddings_available": False,
             "vector_store_available": False,
         },
+        "strategic_agent": {
+            "enabled": False,
+            "configured": False,
+            "provider": "google_genai",
+            "provider_available": False,
+            "model": None,
+            "agent_version": "stratix-strategic-agent-v1",
+            "prompt_version": "strategy-prompt-v1",
+            "tool_schema_version": "strategy-tools-v1",
+            "active_runs": 0,
+            "oldest_queued_run_age_seconds": None,
+            "failed_runs": 0,
+            "citation_validation_failures": 0,
+            "average_evidence_count": None,
+            "budget_exhaustion_count": 0,
+        },
     }
 
 

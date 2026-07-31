@@ -18,12 +18,30 @@ class IntelligenceHealth(BaseModel):
     vector_store_available: bool
 
 
+class StrategicAgentHealth(BaseModel):
+    enabled: bool
+    configured: bool
+    provider: str
+    provider_available: bool
+    model: str | None
+    agent_version: str
+    prompt_version: str
+    tool_schema_version: str
+    active_runs: int
+    oldest_queued_run_age_seconds: float | None
+    failed_runs: int
+    citation_validation_failures: int
+    average_evidence_count: float | None
+    budget_exhaustion_count: int
+
+
 class HealthResponse(BaseModel):
     """Health endpoint response."""
 
     status: Literal["alive", "ready"]
     queue: QueueHealth | None = None
     intelligence: IntelligenceHealth | None = None
+    strategic_agent: StrategicAgentHealth | None = None
 
 
 router = APIRouter(prefix="/health", tags=["health"])
@@ -75,6 +93,29 @@ async def ready(request: Request) -> HealthResponse:
         embeddings_available=embeddings_available,
         vector_store_available=vector_store_available,
     )
+    now = SystemClock().now()
+    diagnostics = await persistence.strategy_runs.operational_diagnostics()
+    configured = bool(settings.strategic_agent_model and settings.gemini_api_key)
+    strategic_agent = StrategicAgentHealth(
+        enabled=settings.strategic_agent_enabled,
+        configured=configured,
+        provider=settings.strategic_agent_provider,
+        provider_available=configured,
+        model=settings.strategic_agent_model or None,
+        agent_version=settings.strategic_agent_version,
+        prompt_version=settings.strategic_agent_prompt_version,
+        tool_schema_version=settings.strategic_agent_tool_schema_version,
+        active_runs=diagnostics.active_runs,
+        oldest_queued_run_age_seconds=(
+            max(0, (now - diagnostics.oldest_queued_at).total_seconds())
+            if diagnostics.oldest_queued_at
+            else None
+        ),
+        failed_runs=diagnostics.failed_runs,
+        citation_validation_failures=diagnostics.citation_validation_failures,
+        average_evidence_count=diagnostics.average_evidence_count,
+        budget_exhaustion_count=diagnostics.budget_exhaustion_count,
+    )
     if settings.competitor_evidence_indexing_required and not (
         embeddings_available and vector_store_available
     ):
@@ -84,7 +125,11 @@ async def ready(request: Request) -> HealthResponse:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
     if not settings.background_jobs_enabled:
-        return HealthResponse(status="ready", intelligence=intelligence)
+        return HealthResponse(
+            status="ready",
+            intelligence=intelligence,
+            strategic_agent=strategic_agent,
+        )
     clock = SystemClock()
     now = clock.now()
     worker_available = await persistence.service_instances.has_fresh(
@@ -111,6 +156,7 @@ async def ready(request: Request) -> HealthResponse:
     return HealthResponse(
         status="ready",
         intelligence=intelligence,
+        strategic_agent=strategic_agent,
         queue=QueueHealth(
             worker_available=worker_available,
             scheduler_available=scheduler_available,

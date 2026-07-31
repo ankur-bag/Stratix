@@ -150,6 +150,8 @@ class EvidenceExcerpt(BaseModel):
     signal_id: str | None = None
     page_start: int | None = None
     page_end: int | None = None
+    before_excerpt: str | None = None
+    after_excerpt: str | None = None
     score: float = Field(ge=-1, le=1)
 
 

@@ -5,6 +5,12 @@ from typing import cast
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.agents.strategic import (
+    DeepStrategicAgent,
+    DisabledStrategicAgent,
+    StrategicAgent,
+)
+from app.agents.tools import StrategicToolFactory
 from app.api.errors import register_error_handlers
 from app.api.health import router as health_router
 from app.api.v1.router import router as api_v1_router
@@ -91,6 +97,7 @@ from app.services.scanning import (
     InProcessCompetitorScanExecutor,
 )
 from app.services.signals import CompetitorSignalService, DeterministicSignalBuilder
+from app.services.strategy import StrategicAnalysisRunner, StrategyService
 from app.services.vector_store import (
     DisabledVectorStore,
     FakeVectorStore,
@@ -116,6 +123,7 @@ def create_app(
     embedding_provider: EmbeddingProvider | None = None,
     vector_store: VectorStore | None = None,
     document_background_executor: BackgroundExecutor | None = None,
+    strategic_agent: StrategicAgent | None = None,
 ) -> FastAPI:
     """Create and configure a Stratix API application instance."""
     application_settings = settings or get_settings()
@@ -230,6 +238,28 @@ def create_app(
             active_vectors = DisabledVectorStore()
             await active_vectors.start()
         job_queue = BackgroundJobQueue(application_persistence, application_settings)
+        intelligence_search_service = IntelligenceSearchService(
+            persistence=application_persistence,
+            embeddings=application_embeddings,
+            vectors=active_vectors,
+            settings=application_settings,
+        )
+        strategic_tool_factory = StrategicToolFactory(
+            application_persistence,
+            intelligence_search_service,
+            application_settings,
+        )
+        application_strategic_agent = strategic_agent or (
+            DeepStrategicAgent(application_settings, strategic_tool_factory)
+            if application_settings.strategic_agent_enabled
+            else DisabledStrategicAgent()
+        )
+        strategic_analysis_runner = StrategicAnalysisRunner(
+            persistence=application_persistence,
+            intelligence=intelligence_search_service,
+            agent=application_strategic_agent,
+            settings=application_settings,
+        )
         evidence_indexing_service = CompetitorEvidenceIndexingService(
             persistence=application_persistence,
             embeddings=application_embeddings,
@@ -373,19 +403,21 @@ def create_app(
         application.state.embedding_provider = application_embeddings
         application.state.document_ingestion_runner = document_runner
         application.state.document_background_executor = document_executor
-        application.state.background_job_service = BackgroundJobService(
-            application_persistence, job_queue
-        )
+        background_job_service = BackgroundJobService(application_persistence, job_queue)
+        application.state.background_job_service = background_job_service
         application.state.monitoring_schedule_service = monitoring_schedule_service
         application.state.notification_service = NotificationService(application_persistence)
-        application.state.intelligence_search_service = IntelligenceSearchService(
-            persistence=application_persistence,
-            embeddings=application_embeddings,
-            vectors=active_vectors,
-            settings=application_settings,
-        )
+        application.state.intelligence_search_service = intelligence_search_service
         application.state.intelligence_reindex_service = IntelligenceReindexService(
             application_persistence, job_queue
+        )
+        application.state.strategic_agent = application_strategic_agent
+        application.state.strategic_analysis_runner = strategic_analysis_runner
+        application.state.strategy_service = StrategyService(
+            persistence=application_persistence,
+            queue=job_queue,
+            background_jobs=background_job_service,
+            settings=application_settings,
         )
         application.state.onboarding_service = CompanyOnboardingService(
             application_persistence,

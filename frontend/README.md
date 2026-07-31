@@ -54,6 +54,7 @@ Server-protected routes:
 - `/dashboard` and `/dashboard/**`
 - `/competitors` and `/competitors/**`
 - `/intelligence`
+- `/strategy`
 - `/settings` and `/settings/**`
 
 Next.js 16 uses `proxy.ts` with `clerkMiddleware()` and the Clerk-recommended matcher. Sensitive route access is enforced again in the protected App Router layout with `await auth()`.
@@ -148,3 +149,36 @@ Competitor detail pages also expose a paginated canonical evidence timeline with
 dates and signal before/after excerpts. Phase 6 provides evidence retrieval and
 historical intelligence; strategic recommendations and autonomous Deep Agent reasoning
 remain reserved for Phase 7.
+
+## Phase 7 strategy workspace
+
+`/strategy` turns already-collected, Organization-authorized evidence into a reviewed
+decision brief. Ask mode accepts a focused strategic question, Compare mode requires at
+least two approved competitors, and Executive brief mode accepts an optional focus.
+Users can bound the date range and select up to ten competitors. Submitting creates a
+durable backend run; it does not call Gemini, Pinecone, a crawler, or any other provider
+from the browser.
+
+The workspace displays queued, retrieval, analysis, validation, partial, successful,
+failed, cancelled, and retry states. Its single visibility-aware poller pauses while the
+tab is hidden and all reads are aborted on unmount or Clerk Organization change. Active
+runs can be cancelled, failed runs can be retried, and a completed report can be rerun
+against the latest evidence over the same-sized lookback window.
+
+Reports visibly separate verified observations, supported inferences, competitor
+comparisons, threats, opportunities, and advisory recommendations. Recommendations show
+impact, effort, horizon, confidence, assumptions, risks, and success indicators.
+Uncertainties and evidence gaps are first-class sections. Citation controls retrieve a
+fresh bounded excerpt from FastAPI; deleted or deauthorized evidence produces a safe
+unavailable state rather than displaying stale browser data.
+
+Report history and feedback are Organization-scoped. Switching Organizations remounts
+the complete workspace and clears reports, citations, errors, feedback, polling, and
+in-flight responses before the next workspace loads. Provider failures, timeouts,
+insufficient evidence, partial reports, and deterministic fallback are user-visible
+without exposing provider exceptions. A fallback is labeled as a verified evidence
+summary, never as an AI strategic report.
+
+The Strategic Deep Agent does not crawl websites directly. It operates only on evidence
+already collected, authorized, and indexed by Stratix. Recommendations are advisory and
+are never executed automatically.

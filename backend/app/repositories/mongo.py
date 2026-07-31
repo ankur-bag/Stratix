@@ -49,6 +49,14 @@ from app.domain.onboarding import (
 )
 from app.domain.scanning import CompetitorScanJob, CompetitorSnapshot, ScanStage, ScanStatus
 from app.domain.signals import CompetitorSignal, SignalStatus, SignalType
+from app.domain.strategy import (
+    ACTIVE_STRATEGY_RUN_STATUSES,
+    StrategicReport,
+    StrategicReportFeedback,
+    StrategyOperationalDiagnostics,
+    StrategyRun,
+    StrategyRunStatus,
+)
 from app.repositories.interfaces import (
     RepositoryConflictError,
     RepositoryUnavailableError,
@@ -88,7 +96,10 @@ def _document(
     | CompetitorScanJob
     | CompetitorSnapshot
     | CompetitorSignal
-    | IntelligenceEvidence,
+    | IntelligenceEvidence
+    | StrategyRun
+    | StrategicReport
+    | StrategicReportFeedback,
 ) -> Document:
     if isinstance(model, CompanyProfile):
         return company_document(model)
@@ -1795,6 +1806,274 @@ class MongoIntelligenceEvidenceRepository:
         }[source_kind]
 
 
+class MongoStrategyRunRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, run: StrategyRun) -> StrategyRun:
+        try:
+            await self._collection.insert_one(_document(run))
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return run
+
+    async def get_by_id(self, organization_id: str, run_id: str) -> StrategyRun | None:
+        document = await _mongo(
+            self._collection.find_one({"_id": run_id, "organization_id": organization_id})
+        )
+        return cast(StrategyRun, model_from_document(StrategyRun, document)) if document else None
+
+    async def get_active_by_request_hash(
+        self, organization_id: str, request_hash: str
+    ) -> StrategyRun | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "request_hash": request_hash,
+                    "status": {"$in": list(ACTIVE_STRATEGY_RUN_STATUSES)},
+                },
+                sort=[("created_at", DESCENDING)],
+            )
+        )
+        return cast(StrategyRun, model_from_document(StrategyRun, document)) if document else None
+
+    async def get_active_for_organization(self, organization_id: str) -> StrategyRun | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "status": {"$in": list(ACTIVE_STRATEGY_RUN_STATUSES)},
+                },
+                sort=[("created_at", DESCENDING)],
+            )
+        )
+        return cast(StrategyRun, model_from_document(StrategyRun, document)) if document else None
+
+    async def update(
+        self, organization_id: str, run_id: str, changes: Mapping[str, Any]
+    ) -> StrategyRun | None:
+        document = await _mongo(
+            self._collection.find_one_and_update(
+                {"_id": run_id, "organization_id": organization_id},
+                {"$set": mongo_update_fields(changes, utc_now())},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        return cast(StrategyRun, model_from_document(StrategyRun, document)) if document else None
+
+    async def list(
+        self,
+        organization_id: str,
+        *,
+        status: StrategyRunStatus | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[StrategyRun]:
+        query: Document = {"organization_id": organization_id}
+        if status is not None:
+            query["status"] = status
+        await self._apply_cursor(query, organization_id, cursor)
+        documents = await _mongo(
+            self._collection.find(query)
+            .sort([("created_at", DESCENDING), ("_id", DESCENDING)])
+            .to_list(length=limit)
+        )
+        return [cast(StrategyRun, model_from_document(StrategyRun, item)) for item in documents]
+
+    async def count_active(self, organization_id: str | None = None) -> int:
+        query: Document = {"status": {"$in": list(ACTIVE_STRATEGY_RUN_STATUSES)}}
+        if organization_id is not None:
+            query["organization_id"] = organization_id
+        return int(await _mongo(self._collection.count_documents(query)))
+
+    async def operational_diagnostics(self) -> StrategyOperationalDiagnostics:
+        active_runs = await _mongo(
+            self._collection.count_documents(
+                {"status": {"$in": list(ACTIVE_STRATEGY_RUN_STATUSES)}}
+            )
+        )
+        oldest_queued = await _mongo(
+            self._collection.find_one(
+                {"status": StrategyRunStatus.QUEUED},
+                sort=[("created_at", ASCENDING)],
+                projection={"created_at": 1},
+            )
+        )
+        failed_runs = await _mongo(
+            self._collection.count_documents({"status": StrategyRunStatus.FAILED})
+        )
+        citation_failures = await _mongo(
+            self._collection.count_documents(
+                {
+                    "status": StrategyRunStatus.FAILED,
+                    "error_code": "STRATEGIC_AGENT_CITATION_INVALID",
+                }
+            )
+        )
+        budget_exhaustion = await _mongo(
+            self._collection.count_documents(
+                {
+                    "error_code": {
+                        "$in": [
+                            "STRATEGIC_AGENT_BUDGET_EXCEEDED",
+                            "STRATEGIC_AGENT_TOOL_LIMIT_EXCEEDED",
+                        ]
+                    }
+                }
+            )
+        )
+        averages = await _mongo(
+            self._collection.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "average": {"$avg": "$retrieved_evidence_count"},
+                        }
+                    }
+                ]
+            ).to_list(length=1)
+        )
+        return StrategyOperationalDiagnostics(
+            active_runs=int(active_runs),
+            oldest_queued_at=oldest_queued.get("created_at") if oldest_queued else None,
+            failed_runs=int(failed_runs),
+            citation_validation_failures=int(citation_failures),
+            average_evidence_count=(
+                float(averages[0]["average"])
+                if averages and averages[0].get("average") is not None
+                else None
+            ),
+            budget_exhaustion_count=int(budget_exhaustion),
+        )
+
+    async def _apply_cursor(
+        self, query: Document, organization_id: str, cursor: str | None
+    ) -> None:
+        if not cursor:
+            return
+        item = await _mongo(
+            self._collection.find_one(
+                {"_id": cursor, "organization_id": organization_id},
+                {"created_at": 1},
+            )
+        )
+        if item and item.get("created_at"):
+            query["$or"] = [
+                {"created_at": {"$lt": item["created_at"]}},
+                {"created_at": item["created_at"], "_id": {"$lt": cursor}},
+            ]
+
+
+class MongoStrategicReportRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def create(self, report: StrategicReport) -> StrategicReport:
+        try:
+            await self._collection.insert_one(_document(report))
+        except DuplicateKeyError as exc:
+            raise RepositoryConflictError from exc
+        except PyMongoError as exc:
+            raise RepositoryUnavailableError from exc
+        return report
+
+    async def get_by_id(self, organization_id: str, report_id: str) -> StrategicReport | None:
+        document = await _mongo(
+            self._collection.find_one({"_id": report_id, "organization_id": organization_id})
+        )
+        return (
+            cast(StrategicReport, model_from_document(StrategicReport, document))
+            if document
+            else None
+        )
+
+    async def get_by_run(
+        self, organization_id: str, strategy_run_id: str
+    ) -> StrategicReport | None:
+        document = await _mongo(
+            self._collection.find_one(
+                {
+                    "organization_id": organization_id,
+                    "strategy_run_id": strategy_run_id,
+                }
+            )
+        )
+        return (
+            cast(StrategicReport, model_from_document(StrategicReport, document))
+            if document
+            else None
+        )
+
+    async def list(
+        self, organization_id: str, *, cursor: str | None, limit: int
+    ) -> list[StrategicReport]:
+        query: Document = {"organization_id": organization_id, "archived": False}
+        if cursor:
+            item = await _mongo(
+                self._collection.find_one(
+                    {"_id": cursor, "organization_id": organization_id},
+                    {"created_at": 1},
+                )
+            )
+            if item and item.get("created_at"):
+                query["$or"] = [
+                    {"created_at": {"$lt": item["created_at"]}},
+                    {"created_at": item["created_at"], "_id": {"$lt": cursor}},
+                ]
+        documents = await _mongo(
+            self._collection.find(query)
+            .sort([("created_at", DESCENDING), ("_id", DESCENDING)])
+            .to_list(length=limit)
+        )
+        return [
+            cast(StrategicReport, model_from_document(StrategicReport, item)) for item in documents
+        ]
+
+
+class MongoStrategicReportFeedbackRepository:
+    def __init__(self, collection: AsyncCollection[Document]) -> None:
+        self._collection = collection
+
+    async def upsert(self, feedback: StrategicReportFeedback) -> StrategicReportFeedback:
+        document = _document(feedback)
+        feedback_id = document.pop("_id")
+        saved = await _mongo(
+            self._collection.find_one_and_update(
+                {
+                    "organization_id": feedback.organization_id,
+                    "report_id": feedback.report_id,
+                    "user_id": feedback.user_id,
+                },
+                {
+                    "$set": {
+                        "feedback": feedback.feedback,
+                        "comment": feedback.comment,
+                        "updated_at": feedback.updated_at,
+                    },
+                    "$setOnInsert": {
+                        "_id": feedback_id,
+                        "organization_id": feedback.organization_id,
+                        "report_id": feedback.report_id,
+                        "user_id": feedback.user_id,
+                        "created_at": feedback.created_at,
+                    },
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        if saved is None:
+            raise RepositoryUnavailableError
+        return cast(
+            StrategicReportFeedback,
+            model_from_document(StrategicReportFeedback, saved),
+        )
+
+
 class MongoPersistence:
     """Own the PyMongo client lifecycle, repositories, and collection indexes."""
 
@@ -1818,6 +2097,9 @@ class MongoPersistence:
         self.competitor_scans: MongoCompetitorScanRepository
         self.competitor_snapshots: MongoCompetitorSnapshotRepository
         self.intelligence_evidence: MongoIntelligenceEvidenceRepository
+        self.strategy_runs: MongoStrategyRunRepository
+        self.strategy_reports: MongoStrategicReportRepository
+        self.strategy_report_feedback: MongoStrategicReportFeedbackRepository
         self.competitor_signals: MongoCompetitorSignalRepository
         self.background_jobs: MongoBackgroundJobRepository
         self.monitoring_schedules: MongoMonitoringScheduleRepository
@@ -1868,6 +2150,11 @@ class MongoPersistence:
         self.competitor_signals = MongoCompetitorSignalRepository(self._database["signals"])
         self.intelligence_evidence = MongoIntelligenceEvidenceRepository(
             self._database["intelligence_evidence"]
+        )
+        self.strategy_runs = MongoStrategyRunRepository(self._database["strategy_runs"])
+        self.strategy_reports = MongoStrategicReportRepository(self._database["strategy_reports"])
+        self.strategy_report_feedback = MongoStrategicReportFeedbackRepository(
+            self._database["strategy_report_feedback"]
         )
         self.background_jobs = MongoBackgroundJobRepository(self._database["background_jobs"])
         self.monitoring_schedules = MongoMonitoringScheduleRepository(
@@ -2184,6 +2471,68 @@ class MongoPersistence:
                 [("organization_id", ASCENDING), ("snapshot_id", ASCENDING)]
             )
             await evidence.create_index([("organization_id", ASCENDING), ("signal_id", ASCENDING)])
+            strategy_runs = self._database["strategy_runs"]
+            await strategy_runs.create_index(
+                [("organization_id", ASCENDING), ("created_at", DESCENDING)]
+            )
+            await strategy_runs.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("status", ASCENDING),
+                    ("created_at", DESCENDING),
+                ]
+            )
+            await strategy_runs.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("request_hash", ASCENDING),
+                    ("status", ASCENDING),
+                ]
+            )
+            await strategy_runs.create_index(
+                [("organization_id", ASCENDING), ("background_job_id", ASCENDING)]
+            )
+            await strategy_runs.create_index(
+                [("company_profile_id", ASCENDING), ("created_at", DESCENDING)]
+            )
+            await strategy_runs.create_index(
+                "completed_at",
+                expireAfterSeconds=self._settings.strategic_run_retention_days * 24 * 60 * 60,
+            )
+            strategy_reports = self._database["strategy_reports"]
+            await strategy_reports.create_index(
+                [("organization_id", ASCENDING), ("created_at", DESCENDING)]
+            )
+            await strategy_reports.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("strategy_run_id", ASCENDING),
+                ],
+                unique=True,
+            )
+            await strategy_reports.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("company_profile_id", ASCENDING),
+                    ("created_at", DESCENDING),
+                ]
+            )
+            await strategy_reports.create_index(
+                "created_at",
+                expireAfterSeconds=self._settings.strategic_report_retention_days * 24 * 60 * 60,
+            )
+            strategy_feedback = self._database["strategy_report_feedback"]
+            await strategy_feedback.create_index(
+                [
+                    ("organization_id", ASCENDING),
+                    ("report_id", ASCENDING),
+                    ("user_id", ASCENDING),
+                ],
+                unique=True,
+            )
+            await strategy_feedback.create_index(
+                [("organization_id", ASCENDING), ("created_at", DESCENDING)]
+            )
             background_jobs = self._database["background_jobs"]
             await background_jobs.create_index(
                 [

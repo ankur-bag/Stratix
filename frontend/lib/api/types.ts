@@ -228,7 +228,7 @@ export type CompetitorScan = {
 
 export type BackgroundJob = {
   id: string;
-  job_type: "company_initialization" | "competitor_baseline_scan" | "competitor_rescan" | "document_ingestion" | "company_intelligence_rebuild" | "pinecone_cleanup" | "document_storage_cleanup" | "retention_cleanup" | "competitor_snapshot_indexing" | "competitor_signal_indexing" | "competitor_intelligence_reindex" | "competitor_evidence_cleanup";
+  job_type: "company_initialization" | "competitor_baseline_scan" | "competitor_rescan" | "document_ingestion" | "company_intelligence_rebuild" | "pinecone_cleanup" | "document_storage_cleanup" | "retention_cleanup" | "competitor_snapshot_indexing" | "competitor_signal_indexing" | "competitor_intelligence_reindex" | "competitor_evidence_cleanup" | "strategic_analysis";
   domain_resource_type: string;
   domain_resource_id: string;
   status: "queued" | "claimed" | "running" | "retry_scheduled" | "succeeded" | "partially_succeeded" | "failed" | "dead_lettered" | "cancel_requested" | "cancelled";
@@ -274,7 +274,10 @@ export type NotificationType =
   | "job_dead_lettered"
   | "competitor_evidence_indexing_failed"
   | "competitor_intelligence_reindex_completed"
-  | "competitor_intelligence_reindex_failed";
+  | "competitor_intelligence_reindex_failed"
+  | "strategic_report_ready"
+  | "strategic_report_failed"
+  | "strategic_report_partial";
 
 export type Notification = {
   id: string;
@@ -395,6 +398,8 @@ export type EvidenceExcerpt = {
   signal_id?: string | null;
   page_start?: number | null;
   page_end?: number | null;
+  before_excerpt?: string | null;
+  after_excerpt?: string | null;
   score: number;
 };
 
@@ -489,4 +494,146 @@ export type IntelligenceIndexingStatus = {
 export type IntelligenceReindexResponse = {
   job_id: string;
   status: string;
+};
+
+export type StrategyMode = "ask" | "compare" | "executive_brief";
+export type StrategyRunStatus =
+  | "queued"
+  | "retrieving_evidence"
+  | "analyzing"
+  | "validating"
+  | "succeeded"
+  | "partially_succeeded"
+  | "failed"
+  | "cancel_requested"
+  | "cancelled";
+
+export type StrategyRun = {
+  id: string;
+  mode: StrategyMode;
+  query: string;
+  competitor_ids: string[];
+  date_from: string;
+  date_to: string;
+  status: StrategyRunStatus;
+  stage: string;
+  progress_percent: number;
+  message: string;
+  report_id: string | null;
+  warnings: string[];
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+};
+
+export type StrategyRunResponse = { run: StrategyRun };
+export type StrategyRunPage = { items: StrategyRun[]; next_cursor: string | null };
+
+export type StrategicClaim = {
+  statement: string;
+  evidence_ids: string[];
+  confidence: "low" | "medium" | "high";
+  competitor_ids: string[];
+  date_from: string | null;
+  date_to: string | null;
+};
+
+export type StrategicComparison = {
+  topic: string;
+  comparison: string;
+  competitor_ids: string[];
+  evidence_ids: string[];
+  confidence: "low" | "medium" | "high";
+  date_from: string | null;
+  date_to: string | null;
+};
+
+export type StrategicRecommendation = {
+  title: string;
+  recommendation: string;
+  rationale: string;
+  evidence_ids: string[];
+  company_context_source_ids: string[];
+  competitor_ids: string[];
+  impact: "low" | "medium" | "high";
+  effort: "low" | "medium" | "high";
+  time_horizon: "immediate" | "near_term" | "medium_term";
+  confidence: "low" | "medium" | "high";
+  assumptions: string[];
+  risks: string[];
+  success_indicators: string[];
+  date_from: string | null;
+  date_to: string | null;
+};
+
+export type StrategicUncertainty = {
+  statement: string;
+  evidence_ids: string[];
+  impact: "low" | "medium" | "high";
+};
+
+export type StrategicEvidenceGap = {
+  topic: string;
+  description: string;
+  why_it_matters: string;
+  competitor_ids: string[];
+};
+
+export type StrategicEvidenceCoverage = {
+  evidence_count: number;
+  cited_evidence_count: number;
+  competitor_count: number;
+  source_type_count: number;
+  earliest_observed_at: string | null;
+  latest_observed_at: string | null;
+  truncated: boolean;
+  warnings: string[];
+};
+
+export type StrategicReport = {
+  id: string;
+  strategy_run_id: string;
+  mode: StrategyMode;
+  title: string;
+  executive_summary: string;
+  situation_assessment: StrategicClaim[];
+  inferences: StrategicClaim[];
+  competitor_comparisons: StrategicComparison[];
+  threats: StrategicClaim[];
+  opportunities: StrategicClaim[];
+  recommendations: StrategicRecommendation[];
+  uncertainties: StrategicUncertainty[];
+  evidence_gaps: StrategicEvidenceGap[];
+  evidence_ids: string[];
+  competitor_ids: string[];
+  evidence_coverage: StrategicEvidenceCoverage;
+  source_coverage: string[];
+  temporal_coverage: { from: string | null; to: string | null };
+  analysis_as_of: string;
+  date_from: string;
+  date_to: string;
+  warnings: string[];
+  deterministic_fallback: boolean;
+  created_at: string;
+};
+
+export type StrategicReportPage = {
+  items: StrategicReport[];
+  next_cursor: string | null;
+};
+
+export type StrategyRunInput = {
+  mode: StrategyMode;
+  query: string;
+  competitor_ids: string[];
+  date_from: string;
+  date_to: string;
+};
+
+export type StrategicFeedbackResponse = {
+  report_id: string;
+  feedback: "helpful" | "not_helpful";
+  comment: string | null;
+  updated_at: string;
 };

@@ -882,11 +882,21 @@ class IntelligenceSearchService:
         )
 
     async def trends(
-        self, context: AuthenticatedContext, *, window_days: int
+        self,
+        context: AuthenticatedContext,
+        *,
+        window_days: int,
+        observed_before: datetime | None = None,
+        competitor_ids: list[str] | None = None,
     ) -> list[IntelligenceTrend]:
-        cutoff = utc_now() - timedelta(days=window_days)
+        before = observed_before or utc_now()
+        cutoff = before - timedelta(days=window_days)
         evidence = await self._persistence.intelligence_evidence.list_active(
-            context.organization_id, observed_after=cutoff, limit=5000
+            context.organization_id,
+            competitor_ids=competitor_ids,
+            observed_after=cutoff,
+            observed_before=before,
+            limit=5000,
         )
         unique_events: dict[str, IntelligenceEvidence] = {}
         for item in evidence:
@@ -895,7 +905,7 @@ class IntelligenceSearchService:
         grouped: dict[IntelligenceCategory, list[IntelligenceEvidence]] = defaultdict(list)
         for item in unique_events.values():
             grouped[item.category].append(item)
-        now = utc_now()
+        now = before
         return [
             IntelligenceTrend(
                 window_days=window_days,
@@ -921,6 +931,24 @@ class IntelligenceSearchService:
             )
             for category, items in sorted(grouped.items(), key=lambda pair: pair[0].value)
         ]
+
+    async def correlations(
+        self,
+        context: AuthenticatedContext,
+        *,
+        competitor_ids: list[str] | None = None,
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+        limit: int = 5000,
+    ) -> list[IntelligenceCorrelation]:
+        evidence = await self._persistence.intelligence_evidence.list_active(
+            context.organization_id,
+            competitor_ids=competitor_ids,
+            observed_after=observed_after,
+            observed_before=observed_before,
+            limit=limit,
+        )
+        return self._correlations(evidence)
 
     async def overview(self, context: AuthenticatedContext) -> IntelligenceOverview:
         recent = await self._persistence.intelligence_evidence.list_active(

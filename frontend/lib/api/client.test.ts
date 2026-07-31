@@ -586,3 +586,45 @@ test("competitor timeline pagination remains bounded and organization authentica
     globalThis.fetch = originalFetch;
   }
 });
+
+test("strategic run creation sends only bounded user inputs", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let captured: RequestInit | undefined;
+  globalThis.fetch = async (input, init) => {
+    capturedUrl = String(input);
+    captured = init;
+    return Response.json({
+      run: {
+        id: "run-1",
+        status: "queued",
+        stage: "queued",
+        progress_percent: 0,
+      },
+    }, { status: 202 });
+  };
+  try {
+    const api = client(async () => "organization-token");
+    await api.createStrategyRun({
+      mode: "ask",
+      query: "What changed?",
+      competitor_ids: ["competitor-1"],
+      date_from: "2026-05-01T00:00:00.000Z",
+      date_to: "2026-07-31T23:59:59.999Z",
+    });
+    assert.equal(capturedUrl, "http://api.test/api/v1/strategy/runs");
+    const body = JSON.parse(String(captured?.body));
+    assert.deepEqual(Object.keys(body).sort(), [
+      "competitor_ids",
+      "date_from",
+      "date_to",
+      "mode",
+      "query",
+    ]);
+    assert.equal("organization_id" in body, false);
+    assert.equal("model_name" in body, false);
+    assert.equal("evidence_ids" in body, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

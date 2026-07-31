@@ -47,6 +47,13 @@ from app.domain.onboarding import (
 )
 from app.domain.scanning import CompetitorScanJob, CompetitorSnapshot, ScanStage, ScanStatus
 from app.domain.signals import CompetitorSignal, SignalStatus, SignalType
+from app.domain.strategy import (
+    StrategicReport,
+    StrategicReportFeedback,
+    StrategyOperationalDiagnostics,
+    StrategyRun,
+    StrategyRunStatus,
+)
 
 
 class RepositoryConflictError(Exception):
@@ -648,6 +655,43 @@ class IntelligenceEvidenceRepository(Protocol):
     async def count_status(self, organization_id: str) -> tuple[int, int, datetime | None]: ...
 
 
+class StrategyRunRepository(Protocol):
+    async def create(self, run: StrategyRun) -> StrategyRun: ...
+    async def get_by_id(self, organization_id: str, run_id: str) -> StrategyRun | None: ...
+    async def get_active_by_request_hash(
+        self, organization_id: str, request_hash: str
+    ) -> StrategyRun | None: ...
+    async def get_active_for_organization(self, organization_id: str) -> StrategyRun | None: ...
+    async def update(
+        self, organization_id: str, run_id: str, changes: Mapping[str, Any]
+    ) -> StrategyRun | None: ...
+    async def list(
+        self,
+        organization_id: str,
+        *,
+        status: StrategyRunStatus | None,
+        cursor: str | None,
+        limit: int,
+    ) -> list[StrategyRun]: ...
+    async def count_active(self, organization_id: str | None = None) -> int: ...
+    async def operational_diagnostics(self) -> StrategyOperationalDiagnostics: ...
+
+
+class StrategicReportRepository(Protocol):
+    async def create(self, report: StrategicReport) -> StrategicReport: ...
+    async def get_by_id(self, organization_id: str, report_id: str) -> StrategicReport | None: ...
+    async def get_by_run(
+        self, organization_id: str, strategy_run_id: str
+    ) -> StrategicReport | None: ...
+    async def list(
+        self, organization_id: str, *, cursor: str | None, limit: int
+    ) -> list[StrategicReport]: ...
+
+
+class StrategicReportFeedbackRepository(Protocol):
+    async def upsert(self, feedback: StrategicReportFeedback) -> StrategicReportFeedback: ...
+
+
 class Persistence(Protocol):
     background_jobs: BackgroundJobRepository
     monitoring_schedules: MonitoringScheduleRepository
@@ -670,6 +714,9 @@ class Persistence(Protocol):
     competitor_snapshots: CompetitorSnapshotRepository
     competitor_signals: CompetitorSignalRepository
     intelligence_evidence: IntelligenceEvidenceRepository
+    strategy_runs: StrategyRunRepository
+    strategy_reports: StrategicReportRepository
+    strategy_report_feedback: StrategicReportFeedbackRepository
 
     async def start(self) -> None: ...
     async def ping(self) -> bool: ...

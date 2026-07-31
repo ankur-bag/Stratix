@@ -413,6 +413,125 @@ explicit provider configuration and an authorized Organization. `GET /health/rea
 reports whether embeddings and the vector store are available; it fails only when
 `COMPETITOR_EVIDENCE_INDEXING_REQUIRED=true` and the required providers are unavailable.
 
+## Phase 7 Strategic Deep Agent
+
+Phase 7 adds an evidence-grounded reporting layer without expanding collection or action
+permissions:
+
+```text
+authenticated strategic request
+-> Organization-scoped strategy_run + durable strategic_analysis job
+-> deterministic LangGraph retrieval/analyze/validate/persist workflow
+-> Phase 6 company context, evidence search, timelines, trends, and correlations
+-> Deep Agents top-level analyst with at most four bounded specialists
+-> strict Pydantic report and canonical citation reauthorization
+-> immutable strategy_report + deduplicated terminal notification
+```
+
+LangGraph owns the deterministic outer workflow, durable job state, progress,
+cancellation, retry, lease-loss checks, and idempotent persistence. Deep Agents 0.7.1
+owns only bounded planning and delegation. The configured Gemini chat model is provided
+through `langchain-google-genai`; the embedding client is not reused as a chat model.
+Normal tests use `FakeStrategicAgent` or `DisabledStrategicAgent` and make no provider
+calls.
+
+The top-level analyst may delegate to Product & Pricing, Engineering & Product Signals,
+GTM & Positioning, and Opportunity & Risk specialists. General-purpose recursive
+subagents are disabled. The registered Google harness excludes `ls`, `read_file`,
+`write_file`, `edit_file`, `glob`, `grep`, and `execute`. The only application tools are:
+
+- `get_company_context`
+- `get_competitor_profiles`
+- `search_intelligence_evidence`
+- `get_evidence_details`
+- `get_competitor_timeline`
+- `get_intelligence_trends`
+- `get_intelligence_correlations`
+- `compare_competitors`
+
+These tools receive Organization, company, user, analysis cutoff, competitor allowlist,
+evidence allowlist, cancellation state, and budgets from immutable server context, not
+model arguments. Every call checks the durable job lease and cancellation state,
+validates competitors, applies date/result/context limits, and reauthorizes canonical
+MongoDB records. No tool exposes MongoDB, Pinecone namespaces or vectors, credentials,
+storage paths, raw PDFs, full pages, crawlers, Tavily, arbitrary URLs, network clients,
+the host filesystem, a shell, or mutation actions.
+
+Prompts treat retrieved text as untrusted data. Evidence containing instructions cannot
+alter tool permissions or tenancy. Every substantive observation, inference, comparison,
+threat, opportunity, and recommendation requires bounded evidence IDs. Recommendations
+also require declared company-context source IDs, assumptions, risks, success
+indicators, and bounded impact/effort/horizon/confidence values. After at most one
+schema-only repair, citations are reloaded in one canonical batch and checked for
+Organization, company, competitor, active/deleted state, date range, and immutable
+`analysis_as_of`. Invalid output is rejected. When evidence or the configured model is
+unavailable, the worker may persist a clearly labeled deterministic evidence summary
+with uncertainties and gaps; it never fabricates recommendations.
+
+The canonical collections are `strategy_runs`, `strategy_reports`, and
+`strategy_report_feedback`. Run indexes cover Organization/time,
+Organization/status/time, Organization/request-hash/status,
+Organization/background-job, company/time, and retention on `completed_at`. Report
+indexes cover Organization/time, unique Organization/run, Organization/company/time, and
+retention on `created_at`. Feedback has a unique Organization/report/user index and an
+Organization/time index. Successful reports are created once per run and otherwise
+immutable except their explicit archival field.
+
+The API surface is:
+
+- `POST /api/v1/strategy/runs`
+- `GET /api/v1/strategy/runs`
+- `GET /api/v1/strategy/runs/{run_id}`
+- `POST /api/v1/strategy/runs/{run_id}/cancel`
+- `POST /api/v1/strategy/runs/{run_id}/retry`
+- `GET /api/v1/strategy/reports`
+- `GET /api/v1/strategy/reports/{report_id}`
+- `GET /api/v1/strategy/reports/{report_id}/citations/{evidence_id}`
+- `POST /api/v1/strategy/reports/{report_id}/feedback`
+
+Enable the feature only after setting the Strategic Deep Agent block in `.env.example`
+with a supported model and the existing server-only `GEMINI_API_KEY`. Configuration
+validation rejects an enabled feature with an empty model and enforces all subagent,
+tool, iteration, timeout, evidence, context, competitor, concurrency, lookback, repair,
+and retention limits. `GET /health/ready` reports cached provider configuration plus
+active/oldest queued/failed runs, citation failures, average retrieved evidence, and
+budget exhaustion; it never calls the model.
+
+Read-only and offline-safe diagnostics:
+
+```powershell
+uv run python scripts/check_strategic_agent.py status
+uv run python scripts/check_strategic_agent.py configuration
+uv run python scripts/check_strategic_agent.py runs --organization-id org_example
+uv run python scripts/benchmark_strategic_agent.py
+uv run python scripts/evaluate_strategic_agent.py
+```
+
+The optional provider connectivity check is separate and requires both
+`--live-provider-smoke` and `STRATIX_LIVE_STRATEGIC_TESTS=true`. It uses no company data.
+Do not enable it in automated tests.
+
+Run the complete application as separate processes:
+
+```powershell
+# API
+uv run fastapi dev app/main.py
+
+# durable worker (required for strategic analysis)
+uv run python -m app.worker
+
+# scheduled monitoring
+uv run python -m app.scheduler
+```
+
+The API never silently executes a strategic analysis. The agent does not crawl websites
+directly; it operates only on evidence already collected, authorized, and indexed by
+Stratix. Recommendations are advisory and are never executed automatically. Production
+billing, messaging integrations, authenticated crawling, GitHub collection, and
+autonomous actions remain out of scope. See
+[`docs/phase7-live-mvp-smoke.md`](docs/phase7-live-mvp-smoke.md) for the complete
+authorized live verification and recovery procedure.
+
 ### Phase 6 authorized smoke test
 
 Run the API, worker, and scheduler as separate processes, then:

@@ -31,6 +31,7 @@ from app.services.intelligence_jobs import (
     EvidenceIndexingJobHandler,
     IntelligenceReindexJobHandler,
 )
+from app.services.strategy import StrategicAnalysisJobHandler
 
 
 async def _run() -> None:
@@ -169,6 +170,9 @@ async def _run() -> None:
             ),
             JobType.COMPETITOR_EVIDENCE_CLEANUP: EvidenceCleanupJobHandler(
                 application.state.evidence_indexing_service
+            ),
+            JobType.STRATEGIC_ANALYSIS: StrategicAnalysisJobHandler(
+                application.state.strategic_analysis_runner
             ),
         }
         worker = DurableWorker(

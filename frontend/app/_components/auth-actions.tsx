@@ -27,6 +27,7 @@ export function HeaderAuthActions() {
           <Link className="transition hover:text-foreground" href="/dashboard">Dashboard</Link>
           <Link className="transition hover:text-foreground" href="/competitors">Competitors</Link>
           <Link className="transition hover:text-foreground" href="/intelligence">Intelligence</Link>
+          <Link className="transition hover:text-foreground" href="/strategy">Strategy</Link>
           <Link className="transition hover:text-foreground" href="/settings">Settings</Link>
         </div>
         {organization ? (

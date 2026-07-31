@@ -10,6 +10,7 @@ from app.api.v1.monitoring_schedules import router as monitoring_schedules_route
 from app.api.v1.notifications import router as notifications_router
 from app.api.v1.onboarding import router as onboarding_router
 from app.api.v1.signals import router as signals_router
+from app.api.v1.strategy import router as strategy_router
 
 router = APIRouter()
 router.include_router(onboarding_router, tags=["company-onboarding"])
@@ -22,3 +23,4 @@ router.include_router(background_jobs_router, tags=["background-jobs"])
 router.include_router(monitoring_schedules_router, tags=["monitoring-schedules"])
 router.include_router(notifications_router, tags=["notifications"])
 router.include_router(intelligence_router, tags=["intelligence"])
+router.include_router(strategy_router, tags=["strategy"])

@@ -137,6 +137,29 @@ class Settings(BaseSettings):
     intelligence_max_competitors_per_query: int = 20
     intelligence_max_evidence_bundle_items: int = 30
     intelligence_structured_synthesis_enabled: bool = False
+    strategic_agent_enabled: bool = False
+    strategic_agent_provider: Literal["google_genai"] = "google_genai"
+    strategic_agent_model: str = ""
+    strategic_agent_version: str = "stratix-strategic-agent-v1"
+    strategic_agent_prompt_version: str = "strategy-prompt-v1"
+    strategic_agent_tool_schema_version: str = "strategy-tools-v1"
+    strategic_agent_max_subagents: int = 4
+    strategic_agent_max_tool_calls: int = 24
+    strategic_agent_max_tool_calls_per_subagent: int = 8
+    strategic_agent_max_iterations: int = 12
+    strategic_agent_timeout_seconds: int = 240
+    strategic_agent_max_repair_attempts: int = 1
+    strategic_agent_max_evidence_items: int = 40
+    strategic_agent_max_evidence_per_tool_call: int = 12
+    strategic_agent_max_context_characters: int = 120_000
+    strategic_agent_max_query_characters: int = 2000
+    strategic_agent_default_lookback_days: int = 90
+    strategic_agent_max_lookback_days: int = 1095
+    strategic_agent_max_competitors: int = 10
+    strategic_agent_max_concurrent_runs_global: int = 2
+    strategic_agent_max_active_runs_per_organization: int = 1
+    strategic_report_retention_days: int = 365
+    strategic_run_retention_days: int = 90
     background_jobs_enabled: bool = True
     embedded_worker_enabled: bool = False
     worker_id_prefix: str = "stratix-worker"
@@ -221,6 +244,16 @@ class Settings(BaseSettings):
     def validate_non_blank_settings(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("Configuration values must not be blank")
+        return value.strip()
+
+    @field_validator(
+        "strategic_agent_model",
+        "strategic_agent_version",
+        "strategic_agent_prompt_version",
+        "strategic_agent_tool_schema_version",
+    )
+    @classmethod
+    def normalize_strategic_identifiers(cls, value: str) -> str:
         return value.strip()
 
     @field_validator(
@@ -481,6 +514,57 @@ class Settings(BaseSettings):
             raise ValueError("Production must run the worker as a separate process")
         if self.app_env == "production" and self.embedded_scheduler_enabled:
             raise ValueError("Production must run the scheduler as a separate process")
+        return self
+
+    @model_validator(mode="after")
+    def validate_strategic_agent_configuration(self) -> "Settings":
+        positive = (
+            self.strategic_agent_max_subagents,
+            self.strategic_agent_max_tool_calls,
+            self.strategic_agent_max_tool_calls_per_subagent,
+            self.strategic_agent_max_iterations,
+            self.strategic_agent_timeout_seconds,
+            self.strategic_agent_max_evidence_items,
+            self.strategic_agent_max_evidence_per_tool_call,
+            self.strategic_agent_max_context_characters,
+            self.strategic_agent_max_query_characters,
+            self.strategic_agent_default_lookback_days,
+            self.strategic_agent_max_lookback_days,
+            self.strategic_agent_max_competitors,
+            self.strategic_agent_max_concurrent_runs_global,
+            self.strategic_agent_max_active_runs_per_organization,
+            self.strategic_report_retention_days,
+            self.strategic_run_retention_days,
+        )
+        if any(value <= 0 for value in positive):
+            raise ValueError("Strategic agent limits must be positive")
+        if not 0 <= self.strategic_agent_max_repair_attempts <= 1:
+            raise ValueError("STRATEGIC_AGENT_MAX_REPAIR_ATTEMPTS must be zero or one")
+        if self.strategic_agent_max_subagents > 4:
+            raise ValueError("STRATEGIC_AGENT_MAX_SUBAGENTS cannot exceed four")
+        if self.strategic_agent_max_tool_calls_per_subagent > self.strategic_agent_max_tool_calls:
+            raise ValueError("Per-specialist tool calls cannot exceed the run tool budget")
+        if (
+            self.strategic_agent_max_evidence_per_tool_call
+            > self.strategic_agent_max_evidence_items
+        ):
+            raise ValueError("Per-tool evidence cannot exceed the run evidence budget")
+        if self.strategic_agent_default_lookback_days > self.strategic_agent_max_lookback_days:
+            raise ValueError("Strategic default lookback cannot exceed its maximum")
+        if self.strategic_agent_enabled and not self.strategic_agent_model:
+            raise ValueError(
+                "STRATEGIC_AGENT_MODEL is required when STRATEGIC_AGENT_ENABLED is true"
+            )
+        if self.strategic_agent_enabled and not self.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is required when STRATEGIC_AGENT_ENABLED is true")
+        if not all(
+            (
+                self.strategic_agent_version,
+                self.strategic_agent_prompt_version,
+                self.strategic_agent_tool_schema_version,
+            )
+        ):
+            raise ValueError("Strategic agent version identifiers must not be blank")
         return self
 
 

@@ -12,6 +12,7 @@ import type {
   CompanyDocument,
   DocumentIngestionJob,
   DocumentUploadResponse,
+  EvidenceExcerpt,
   MonitoringCadence,
   MonitoringSchedule,
   Notification,
@@ -24,6 +25,12 @@ import type {
   IntelligenceReindexResponse,
   IntelligenceSearchInput,
   IntelligenceSearchResponse,
+  StrategicFeedbackResponse,
+  StrategicReport,
+  StrategicReportPage,
+  StrategyRunInput,
+  StrategyRunPage,
+  StrategyRunResponse,
 } from "./types";
 
 export type ApiErrorEnvelope = {
@@ -480,6 +487,73 @@ export class ApiClient {
       method: "POST",
       body: JSON.stringify({ competitor_ids: competitorIds }),
     });
+  }
+
+  createStrategyRun(input: StrategyRunInput): Promise<StrategyRunResponse> {
+    return this.request("/api/v1/strategy/runs", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  listStrategyRuns(signal?: AbortSignal): Promise<StrategyRunPage> {
+    return this.request("/api/v1/strategy/runs?limit=25", { signal });
+  }
+
+  getStrategyRun(runId: string, signal?: AbortSignal): Promise<StrategyRunResponse> {
+    return this.request(`/api/v1/strategy/runs/${encodeURIComponent(runId)}`, {
+      signal,
+    });
+  }
+
+  cancelStrategyRun(runId: string): Promise<StrategyRunResponse> {
+    return this.request(
+      `/api/v1/strategy/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: "POST" },
+    );
+  }
+
+  retryStrategyRun(runId: string): Promise<StrategyRunResponse> {
+    return this.request(
+      `/api/v1/strategy/runs/${encodeURIComponent(runId)}/retry`,
+      { method: "POST" },
+    );
+  }
+
+  listStrategicReports(signal?: AbortSignal): Promise<StrategicReportPage> {
+    return this.request("/api/v1/strategy/reports?limit=25", { signal });
+  }
+
+  getStrategicReport(reportId: string, signal?: AbortSignal): Promise<StrategicReport> {
+    return this.request(
+      `/api/v1/strategy/reports/${encodeURIComponent(reportId)}`,
+      { signal },
+    );
+  }
+
+  getStrategicCitation(
+    reportId: string,
+    evidenceId: string,
+    signal?: AbortSignal,
+  ): Promise<EvidenceExcerpt> {
+    return this.request(
+      `/api/v1/strategy/reports/${encodeURIComponent(reportId)}/citations/${encodeURIComponent(evidenceId)}`,
+      { signal },
+    );
+  }
+
+  submitStrategicFeedback(
+    reportId: string,
+    feedback: "helpful" | "not_helpful",
+    comment?: string,
+  ): Promise<StrategicFeedbackResponse> {
+    return this.request(
+      `/api/v1/strategy/reports/${encodeURIComponent(reportId)}/feedback`,
+      {
+        method: "POST",
+        body: JSON.stringify({ feedback, comment: comment || null }),
+      },
+    );
   }
 
   private async toApiError(response: Response): Promise<ApiError> {

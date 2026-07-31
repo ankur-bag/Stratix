@@ -18,6 +18,7 @@ class JobType(StrEnum):
     COMPETITOR_SIGNAL_INDEXING = "competitor_signal_indexing"
     COMPETITOR_INTELLIGENCE_REINDEX = "competitor_intelligence_reindex"
     COMPETITOR_EVIDENCE_CLEANUP = "competitor_evidence_cleanup"
+    STRATEGIC_ANALYSIS = "strategic_analysis"
 
 
 class BackgroundJobStatus(StrEnum):
@@ -164,6 +165,9 @@ class NotificationType(StrEnum):
     COMPETITOR_EVIDENCE_INDEXING_FAILED = "competitor_evidence_indexing_failed"
     COMPETITOR_INTELLIGENCE_REINDEX_COMPLETED = "competitor_intelligence_reindex_completed"
     COMPETITOR_INTELLIGENCE_REINDEX_FAILED = "competitor_intelligence_reindex_failed"
+    STRATEGIC_REPORT_READY = "strategic_report_ready"
+    STRATEGIC_REPORT_FAILED = "strategic_report_failed"
+    STRATEGIC_REPORT_PARTIAL = "strategic_report_partial"
 
 
 class NotificationSeverity(StrEnum):

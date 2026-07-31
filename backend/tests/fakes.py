@@ -54,6 +54,11 @@ from app.repositories.memory_jobs import (
     InMemoryNotificationRepository,
     InMemoryServiceInstanceRepository,
 )
+from app.repositories.memory_strategy import (
+    InMemoryStrategicReportFeedbackRepository,
+    InMemoryStrategicReportRepository,
+    InMemoryStrategyRunRepository,
+)
 
 
 class InMemoryCompanyProfileRepository:
@@ -1448,6 +1453,9 @@ class InMemoryPersistence:
         self.competitor_snapshots = InMemoryCompetitorSnapshotRepository()
         self.competitor_signals = InMemoryCompetitorSignalRepository()
         self.intelligence_evidence = InMemoryIntelligenceEvidenceRepository()
+        self.strategy_runs = InMemoryStrategyRunRepository()
+        self.strategy_reports = InMemoryStrategicReportRepository()
+        self.strategy_report_feedback = InMemoryStrategicReportFeedbackRepository()
         self.ready = ready
         self.started = False
         self.closed = False
