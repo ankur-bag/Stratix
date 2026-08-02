@@ -107,6 +107,8 @@ async def test_source_discovery_is_deterministic_same_domain_and_bounded() -> No
                 url="https://acme.example",
                 links=[
                     "https://acme.example/login",
+                    "https://acme.example/sign-in",
+                    "https://acme.example/sign-up",
                     "https://other.example/pricing",
                     "https://acme.example/pricing?utm_campaign=x",
                     "https://docs.acme.example/documentation",
@@ -130,4 +132,13 @@ async def test_source_discovery_is_deterministic_same_domain_and_bounded() -> No
     second = await service.discover(organization_id="org_test", competitor_id="competitor-1")
     assert first == second
     assert [item.page_type for item in first] == ["website", "pricing", "features"]
-    assert all("other.example" not in item.url and "/login" not in item.url for item in first)
+    assert all(
+        "other.example" not in item.url
+        and "/login" not in item.url
+        and "/sign-in" not in item.url
+        and "/sign-up" not in item.url
+        for item in first
+    )
+    assert not any(
+        request.url.path in {"/login", "/sign-in", "/sign-up"} for request in crawler.requests
+    )

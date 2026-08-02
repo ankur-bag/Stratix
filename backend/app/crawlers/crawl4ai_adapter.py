@@ -95,7 +95,7 @@ class Crawl4AIWebsiteCrawler:
                 for link in self._policy.select_links(
                     page.links, registered_url, max_pages=remaining
                 ):
-                    if link.casefold() not in visited:
+                    if not self._policy.is_excluded_url(link) and link.casefold() not in visited:
                         queue.append((link, depth + 1))
 
         if not pages:

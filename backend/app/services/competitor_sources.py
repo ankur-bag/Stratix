@@ -28,24 +28,6 @@ from app.domain.onboarding import new_id, utc_now
 from app.repositories.interfaces import Persistence, RepositoryConflictError
 from app.services.normalization import ContentNormalizer
 
-EXCLUDED_ROUTE = re.compile(
-    r"(?:^|/)(?:login|log-in|signin|sign-in|signup|sign-up|account|admin|checkout|cart|"
-    r"private|dashboard|profile|settings)(?:/|$)",
-    re.IGNORECASE,
-)
-EXCLUDED_FILE_SUFFIXES = (
-    ".pdf",
-    ".zip",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".svg",
-    ".css",
-    ".js",
-    ".xml",
-    ".json",
-)
 COMMON_SOURCE_PATHS = (
     "/pricing",
     "/product",
@@ -169,7 +151,9 @@ class DeterministicCompetitorSourceDiscoveryService:
             except ValueError:
                 continue
             path = urlsplit(canonical).path.casefold()
-            if EXCLUDED_ROUTE.search(path) or path.endswith(EXCLUDED_FILE_SUFFIXES):
+            if self._policy.is_excluded_url(canonical) or self._policy.has_excluded_file_suffix(
+                canonical
+            ):
                 continue
             if canonical.casefold() in seen:
                 continue

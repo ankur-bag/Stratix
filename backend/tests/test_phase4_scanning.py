@@ -166,6 +166,10 @@ async def test_baseline_unchanged_rescan_and_pricing_change() -> None:
     assert signal.numeric_changes[0].after == "59"
     assert signal.previous_snapshot_id != signal.current_snapshot_id
 
+    await runner.run(scan_id=changed.scan.id, organization_id="org_test")
+    assert len(persistence.competitor_snapshots.items) == 2
+    assert len(persistence.competitor_signals.items) == 1
+
 
 def test_scan_api_is_idempotent_and_organization_scoped(
     client, persistence: InMemoryPersistence

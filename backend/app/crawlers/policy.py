@@ -1,11 +1,16 @@
 import asyncio
+import posixpath
+import re
 import socket
 from ipaddress import ip_address
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
+from app.core.logging import get_logger
 from app.crawlers.models import CrawlErrorCode
 from app.domain.onboarding import normalize_website_url
+
+logger = get_logger(__name__)
 
 PRIORITY_PATH_TERMS = (
     "pricing",
@@ -19,6 +24,52 @@ PRIORITY_PATH_TERMS = (
     "blog",
     "customers",
     "integrations",
+)
+
+EXCLUDED_CRAWL_PATH_SEGMENTS = frozenset(
+    {
+        "account",
+        "admin",
+        "auth",
+        "cart",
+        "checkout",
+        "dashboard",
+        "forgot-password",
+        "legal",
+        "log-in",
+        "login",
+        "logout",
+        "oauth",
+        "privacy",
+        "privacy-policy",
+        "private",
+        "profile",
+        "register",
+        "reset-password",
+        "settings",
+        "sign-in",
+        "sign-up",
+        "signin",
+        "signup",
+        "sso",
+        "terms",
+        "terms-of-service",
+        "verify-email",
+    }
+)
+
+EXCLUDED_CRAWL_FILE_SUFFIXES = (
+    ".pdf",
+    ".zip",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".css",
+    ".js",
+    ".xml",
+    ".json",
 )
 
 
@@ -50,12 +101,18 @@ class CrawlPolicy:
 
     async def validate_target(self, url: str, registered_url: str) -> str:
         try:
-            normalized = normalize_website_url(url)
+            normalized = self.normalize_candidate(url, registered_url)
         except ValueError as exc:
             raise CrawlPolicyViolation(
                 CrawlErrorCode.INVALID_CRAWL_TARGET,
                 "The crawl target is not a valid public HTTP(S) URL.",
             ) from exc
+        if self.is_excluded_url(normalized):
+            self._log_rejection(normalized, "excluded_path")
+            raise CrawlPolicyViolation(
+                CrawlErrorCode.INVALID_CRAWL_TARGET,
+                "The crawl target path is excluded by policy.",
+            )
         if not self.is_same_company_domain(normalized, registered_url):
             raise CrawlPolicyViolation(
                 CrawlErrorCode.INVALID_CRAWL_TARGET,
@@ -88,13 +145,59 @@ class CrawlPolicy:
         unique: dict[str, str] = {}
         for link in links:
             try:
-                normalized = normalize_website_url(link)
+                normalized = self.normalize_candidate(link, registered_url)
             except ValueError:
                 continue
-            if self.is_same_company_domain(normalized, registered_url):
-                unique.setdefault(normalized.casefold(), normalized)
+            if self.is_excluded_url(normalized):
+                self._log_rejection(normalized, "excluded_path")
+                continue
+            if self.has_excluded_file_suffix(normalized):
+                self._log_rejection(normalized, "excluded_file_route")
+                continue
+            if not self.is_same_company_domain(normalized, registered_url):
+                continue
+            unique.setdefault(normalized.casefold(), normalized)
         ordered = sorted(unique.values(), key=self._priority)
         return ordered[:max_pages]
+
+    @classmethod
+    def normalize_candidate(cls, value: str, registered_url: str) -> str:
+        """Resolve a relative link and normalize its path for deterministic policy checks."""
+        base = f"{registered_url.rstrip('/')}/"
+        candidate = urljoin(base, value.strip())
+        normalized = normalize_website_url(candidate)
+        parsed = urlsplit(normalized)
+        path = cls.normalized_path(normalized)
+        rendered_path = "" if path == "/" else quote(path, safe="/:@-._~!$&'()*+,;=")
+        return urlunsplit((parsed.scheme, parsed.netloc, rendered_path, parsed.query, ""))
+
+    @staticmethod
+    def normalized_path(value: str) -> str:
+        """Decode and canonicalize a URL path without using substring matching."""
+        path = urlsplit(value).path.replace("\\", "/")
+        for _ in range(3):
+            decoded = unquote(path)
+            if decoded == path:
+                break
+            path = decoded
+        path = re.sub(r"/+", "/", path)
+        normalized = posixpath.normpath(path or "/")
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        return "/" if normalized == "/." else normalized.rstrip("/") or "/"
+
+    @classmethod
+    def is_excluded_url(cls, value: str) -> bool:
+        segments = {
+            segment.casefold()
+            for segment in cls.normalized_path(value).split("/")
+            if segment and segment not in {".", ".."}
+        }
+        return bool(segments & EXCLUDED_CRAWL_PATH_SEGMENTS)
+
+    @classmethod
+    def has_excluded_file_suffix(cls, value: str) -> bool:
+        return cls.normalized_path(value).casefold().endswith(EXCLUDED_CRAWL_FILE_SUFFIXES)
 
     @staticmethod
     def is_same_company_domain(url: str, registered_url: str) -> bool:
@@ -117,6 +220,16 @@ class CrawlPolicy:
             len(PRIORITY_PATH_TERMS) + 1,
         )
         return (rank, path.count("/"), url)
+
+    @classmethod
+    def _log_rejection(cls, value: str, category: str) -> None:
+        parsed = urlsplit(value)
+        logger.info(
+            "crawl_url_rejected",
+            rejection_category=category,
+            hostname=parsed.hostname,
+            path=cls.normalized_path(value),
+        )
 
     @staticmethod
     def _is_public_address(value: str) -> bool:

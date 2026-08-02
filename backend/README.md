@@ -157,11 +157,19 @@ The offline benchmark and Pinecone diagnostic are available as:
 
 ```powershell
 uv run python scripts/benchmark_document_ingestion.py
-uv run python scripts/check_pinecone.py
-uv run python scripts/check_pinecone.py --smoke-test
+uv run python scripts/check_pinecone.py status
+uv run python scripts/check_pinecone.py validate
+uv run python scripts/check_pinecone.py smoke-test --confirm-temporary-write
 ```
 
-The diagnostic only describes and validates the configured manual index. Its optional smoke test uses a temporary namespace and deletes only its temporary vectors; it never creates or deletes an index. Live Gemini, Pinecone, S3, and private-document smoke tests require explicit credentials and authorization and were not run by the automated suite.
+`status` is read-only and reports only safe configuration flags and expected index
+properties. `validate` uses the same application settings loader as FastAPI and
+connects only when Pinecone vector search is enabled and fully configured. The
+guarded `smoke-test` uses a dedicated `stratix-diagnostic-smoke-*` namespace and
+deletes that complete temporary namespace; it never uses an Organization namespace
+and never creates or deletes an index. Live Gemini, Pinecone, S3, and
+private-document smoke tests require explicit credentials and authorization and were
+not run by the automated suite.
 
 Add actual provider secrets manually only to `backend/.env`; never commit that
 file. `GEMINI_API_KEY`, `PINECONE_API_KEY`, and `PINECONE_HOST` must not appear
